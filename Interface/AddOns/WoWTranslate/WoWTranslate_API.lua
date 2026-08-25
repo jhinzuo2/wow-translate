@@ -245,10 +245,6 @@ local function PollTranslations()
                         -- Successful response: reset everything.
                         consecutiveApiErrors = 0
                         rateLimitBackoff     = 15
-                        -- Google Translate sometimes inserts a space after an apostrophe
-                        -- when translating from languages that have no contractions (e.g. Chinese),
-                        -- producing "doesn' t" or "won'  t".  Strip the extra space(s).
-                        translation = string.gsub(translation, "'%s+(%a)", "'%1")
                         _cbOk, _cbErr = pcall(req.callback, translation, nil)
                     end
                     if not _cbOk then
@@ -359,6 +355,60 @@ function WoWTranslate_API.TranslateOutgoing(text, callback)
     if not success then
         pendingRequests[requestId] = nil
 		pendingTexts[text] = nil 
+        if callback then
+            callback(nil, "DLL call failed: " .. tostring(err))
+        end
+        return false
+    end
+
+    OnRequestQueued()
+    return true, requestId
+end
+
+-- Request an async back-translation of what was sent (zh -> en by default).
+-- Separate from Translate() so incoming-message dedup cannot steal the slot.
+function WoWTranslate_API.TranslateBack(text, callback)
+    if not dllAvailable then
+        if callback then
+            callback(nil, "DLL not available")
+        end
+        return false
+    end
+
+    if not text or text == "" then
+        if callback then
+            callback(nil, "Empty text")
+        end
+        return false
+    end
+
+    if activePendingCount >= MAX_PENDING then
+        if callback then callback(nil, "Queue full, try again shortly") end
+        return false
+    end
+
+    if GetTime() < rateLimitedUntil then
+        if callback then callback(nil, "Rate limited") end
+        return false
+    end
+
+    requestCounter = requestCounter + 1
+    local requestId = "back_" .. tostring(requestCounter)
+
+    pendingRequests[requestId] = {
+        callback = callback,
+        text = text,
+        timestamp = GetTime()
+    }
+
+    local fromLang = WoWTranslateDB and WoWTranslateDB.outgoingToLang or "zh"
+    local toLang = WoWTranslateDB and WoWTranslateDB.outgoingFromLang or "en"
+    local success, err = pcall(function()
+        UnitXP("WoWTranslate", "translate_async", requestId, text, fromLang, toLang)
+    end)
+
+    if not success then
+        pendingRequests[requestId] = nil
         if callback then
             callback(nil, "DLL call failed: " .. tostring(err))
         end

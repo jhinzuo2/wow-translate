@@ -1,0 +1,7 @@
+<Bindings>
+	<Binding name="WOWTRANSLATE_TOGGLEOUTGOING" header="WOWTRANSLATE">
+		if WoWTranslate_ToggleOutgoingEnabled then
+			WoWTranslate_ToggleOutgoingEnabled(true)
+		end
+	</Binding>
+</Bindings>

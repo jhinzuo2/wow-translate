@@ -1,7 +1,8 @@
 ## Interface: 11200
 ## Title: WoWTranslate
 ## Notes: Real-time chat translation for WoW 1.12
-## Version: 1.5
+## OptionalDeps: WIM
+## Version: 1.3
 ## Author: belthazor, WoWTranslateTeam
 ## SavedVariables: WoWTranslateDB WoWTranslateCache WoWTranslateDebugLog
 
@@ -11,4 +12,6 @@ WoWTranslate_Cache.lua
 WoWTranslate_API.lua
 WoWTranslate_Config.lua
 WoWTranslate_Minimap.lua
+WoWTranslate_OutgoingToggle.lua
 WoWTranslate.lua
+Bindings.xml
