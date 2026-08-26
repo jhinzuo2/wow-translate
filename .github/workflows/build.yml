@@ -12,7 +12,11 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # Pinned instead of windows-latest: the newer windows-latest image has
+    # had intermittent CMake/vswhere VS-detection failures
+    # ("could not find any instance of Visual Studio") on several repos.
+    # windows-2022 is the known-good image with a stable VS2022 install.
+    runs-on: windows-2022
 
     steps:
     - name: Checkout repository
@@ -20,6 +24,14 @@ jobs:
 
     - name: Setup CMake
       uses: lukka/get-cmake@latest
+
+    # get-cmake only installs cmake.exe — it does NOT set up the MSVC
+    # environment, so CMake's VS generator can fail to auto-detect the
+    # installed Visual Studio. This explicitly runs vcvarsall.bat first.
+    - name: Setup MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x86  # 32-bit, matches the -A Win32 CMake config below
 
     - name: Configure CMake (32-bit)
       working-directory: dll
