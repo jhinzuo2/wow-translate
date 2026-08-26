@@ -174,11 +174,21 @@ bool TranslationClient::Initialize() {
 
     LOG_INFO("Initializing Google Free translation client");
 
-    hSession = WinHttpOpen(L"WoWTranslate/1.0",
-                           WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                           WINHTTP_NO_PROXY_NAME,
-                           WINHTTP_NO_PROXY_BYPASS,
-                           0);
+    // NOTE: The session-level "product name" here doubles as the default
+    // User-Agent for every request on this session unless a request
+    // explicitly overrides it. Using a self-identifying string like
+    // "WoWTranslate/1.0" flags this as a non-browser client to Google's
+    // abuse detection on the undocumented gtx endpoint, which can trigger
+    // 429s almost immediately. Use a realistic browser UA here so any
+    // request that (for whatever reason) doesn't get its per-request
+    // override still looks like ordinary browser traffic.
+    hSession = WinHttpOpen(
+        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        L"(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0);
     if (!hSession) {
         LOG_ERROR("Failed to initialize WinHTTP session");
         return false;
@@ -292,10 +302,18 @@ string TranslationClient::HttpsGet(const string& path) {
         return "";
     }
 
-    // Identify as a browser to avoid 403s
-    wstring headers = L"User-Agent: Mozilla/5.0\r\n";
+    // Identify as a real browser to avoid 403/429s from Google's abuse
+    // detection on the undocumented gtx endpoint. IMPORTANT: this must
+    // use ADD | REPLACE, not ADD alone. WinHttpOpen() above already sets
+    // a session-level User-Agent; ADD alone appends a *second*
+    // User-Agent header rather than replacing the session default,
+    // producing a malformed double-header request that no real browser
+    // would ever send and that made things worse, not better.
+    wstring headers =
+        L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        L"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n";
     WinHttpAddRequestHeaders(hRequest, headers.c_str(), (DWORD)-1,
-                             WINHTTP_ADDREQ_FLAG_ADD);
+                             WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
 
     BOOL result = WinHttpSendRequest(hRequest,
                                      WINHTTP_NO_ADDITIONAL_HEADERS, 0,
