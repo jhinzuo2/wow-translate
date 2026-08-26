@@ -11,6 +11,8 @@
 #include <locale>
 #include <vector>
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
 
 #include "../include/translator_core.h"
 #include "../include/logging.h"
@@ -174,6 +176,9 @@ bool TranslationClient::Initialize() {
 
     LOG_INFO("Initializing Google Free translation client");
 
+    // Seed jitter for backoff randomness
+    srand((unsigned)time(nullptr));
+
     // NOTE: The session-level "product name" here doubles as the default
     // User-Agent for every request on this session unless a request
     // explicitly overrides it. Using a self-identifying string like
@@ -287,76 +292,136 @@ string TranslationClient::MapLangCode(const string& lang) {
     return lang;
 }
 
+// Updated HttpsGet: adds realistic browser headers and simple exponential-backoff retries.
+// Note: we do NOT add Accept-Encoding here to avoid needing decompression; if you add it,
+// implement decompression (gzip/deflate/br) or enable WinHTTP decompression options.
 string TranslationClient::HttpsGet(const string& path) {
     if (!hConnect) return "";
 
     wstring wPath(path.begin(), path.end());
 
-    HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect, L"GET", wPath.c_str(), nullptr,
-        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-        WINHTTP_FLAG_SECURE);
+    const int maxRetries = 4;
+    int attempt = 0;
+    int backoffMs = 500; // initial backoff
 
-    if (!hRequest) {
-        LOG_ERROR("Failed to open GET request");
-        return "";
-    }
+    while (attempt < maxRetries) {
+        attempt++;
 
-    // Identify as a real browser to avoid 403/429s from Google's abuse
-    // detection on the undocumented gtx endpoint. IMPORTANT: this must
-    // use ADD | REPLACE, not ADD alone. WinHttpOpen() above already sets
-    // a session-level User-Agent; ADD alone appends a *second*
-    // User-Agent header rather than replacing the session default,
-    // producing a malformed double-header request that no real browser
-    // would ever send and that made things worse, not better.
-    wstring headers =
-        L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        L"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n";
-    WinHttpAddRequestHeaders(hRequest, headers.c_str(), (DWORD)-1,
-                             WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        HINTERNET hRequest = WinHttpOpenRequest(
+            hConnect, L"GET", wPath.c_str(), nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+            WINHTTP_FLAG_SECURE);
 
-    BOOL result = WinHttpSendRequest(hRequest,
-                                     WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                     nullptr, 0, 0, 0);
-
-    string response;
-    if (result && WinHttpReceiveResponse(hRequest, nullptr)) {
-        // Read HTTP status code before consuming the body.
-        // A 429 response has an unparseable body; surface it explicitly
-        // so the Lua side can trigger immediate backoff rather than treating
-        // it as a generic API parse failure.
-        DWORD statusCode = 0;
-        DWORD statusLen  = sizeof(DWORD);
-        WinHttpQueryHeaders(hRequest,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX,
-            &statusCode, &statusLen,
-            WINHTTP_NO_HEADER_INDEX);
-        if (statusCode == 429) {
-            LOG_WARNING("Rate limited by Google (HTTP 429)");
-            WinHttpCloseHandle(hRequest);
-            return "HTTP_429";
+        if (!hRequest) {
+            LOG_ERROR("Failed to open GET request");
+            return "";
         }
 
-        DWORD bytesAvailable = 0;
-        char buffer[8192];
-        while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable)
-               && bytesAvailable > 0) {
-            DWORD bytesRead = 0;
-            DWORD bytesToRead = min(bytesAvailable, (DWORD)(sizeof(buffer) - 1));
-            if (WinHttpReadData(hRequest, buffer, bytesToRead, &bytesRead)) {
-                buffer[bytesRead] = '\0';
-                response += string(buffer, bytesRead);
-            } else {
-                break;
+        // More realistic browser headers to reduce fingerprinting
+        wstring headers =
+            L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            L"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n"
+            L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\n"
+            L"Accept-Language: en-US,en;q=0.9\r\n"
+            // Do NOT add Accept-Encoding here unless you implement decompression below.
+            L"Referer: https://translate.google.com/\r\n"
+            L"Origin: https://translate.google.com\r\n"
+            L"Connection: keep-alive\r\n";
+
+        WinHttpAddRequestHeaders(hRequest, headers.c_str(), (DWORD)-1,
+                                 WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+
+        BOOL result = WinHttpSendRequest(hRequest,
+                                         WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                         nullptr, 0, 0, 0);
+
+        string response;
+        if (result && WinHttpReceiveResponse(hRequest, nullptr)) {
+            // Read HTTP status code before consuming the body.
+            DWORD statusCode = 0;
+            DWORD statusLen  = sizeof(DWORD);
+            WinHttpQueryHeaders(hRequest,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                &statusCode, &statusLen,
+                WINHTTP_NO_HEADER_INDEX);
+
+            if (statusCode == 429) {
+                LOG_WARNING("Rate limited by Google (HTTP 429) on attempt " + to_string(attempt));
+
+                // Try to read Retry-After header (if present) and respect it
+                DWORD headerSize = 0;
+                if (!WinHttpQueryHeaders(hRequest,
+                        WINHTTP_QUERY_RETRY_AFTER,
+                        WINHTTP_HEADER_NAME_BY_INDEX,
+                        nullptr, &headerSize, WINHTTP_NO_HEADER_INDEX)) {
+                    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && headerSize > 0) {
+                        std::vector<wchar_t> buf(headerSize / sizeof(wchar_t) + 1);
+                        if (WinHttpQueryHeaders(hRequest,
+                                WINHTTP_QUERY_RETRY_AFTER,
+                                WINHTTP_HEADER_NAME_BY_INDEX,
+                                buf.data(), &headerSize, WINHTTP_NO_HEADER_INDEX)) {
+                            wstring wRetry(buf.data());
+                            int secs = _wtoi(wRetry.c_str());
+                            if (secs > 0) {
+                                WinHttpCloseHandle(hRequest);
+                                Sleep(secs * 1000);
+                                // If this was the last attempt, return HTTP_429 so caller can back off permanently
+                                if (attempt >= maxRetries) return "HTTP_429";
+                                backoffMs *= 2;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                WinHttpCloseHandle(hRequest);
+
+                if (attempt >= maxRetries) {
+                    return "HTTP_429";
+                }
+
+                // Exponential backoff with small jitter
+                int jitter = rand() % 200; // 0..199 ms
+                Sleep(backoffMs + jitter);
+                backoffMs *= 2;
+                continue;
             }
+
+            DWORD bytesAvailable = 0;
+            char buffer[8192];
+            while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable)
+                   && bytesAvailable > 0) {
+                DWORD bytesRead = 0;
+                DWORD bytesToRead = min(bytesAvailable, (DWORD)(sizeof(buffer) - 1));
+                if (WinHttpReadData(hRequest, buffer, bytesToRead, &bytesRead)) {
+                    buffer[bytesRead] = '\0';
+                    response += string(buffer, bytesRead);
+                } else {
+                    break;
+                }
+            }
+
+            WinHttpCloseHandle(hRequest);
+
+            // Success: return response (may be empty if server sent empty body)
+            return response;
+        } else {
+            DWORD err = GetLastError();
+            LOG_ERROR("GET request failed (attempt " + to_string(attempt) + "): " + to_string(err));
+            WinHttpCloseHandle(hRequest);
+
+            if (attempt >= maxRetries) break;
+
+            int jitter = rand() % 200;
+            Sleep(backoffMs + jitter);
+            backoffMs *= 2;
+            continue;
         }
-    } else {
-        LOG_ERROR("GET request failed: " + to_string(GetLastError()));
     }
 
-    WinHttpCloseHandle(hRequest);
-    return response;
+    // Exhausted retries
+    return "";
 }
 
 string TranslationClient::ParseGoogleFreeResponse(const string& json) {
@@ -468,7 +533,7 @@ TranslationResult TranslationClient::TranslateText(const string& text, string& r
 }
 
 // Queue async translation request
-bool TranslationClient::TranslateAsync(const string& requestId, const string& text,
+bool TranslationClient::TranslateAsync(const string& requestId, the string& text,
                                        const string& sourceLang, const string& targetLang) {
     if (!initialized || !running) {
         return false;
