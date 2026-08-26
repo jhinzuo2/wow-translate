@@ -533,7 +533,7 @@ TranslationResult TranslationClient::TranslateText(const string& text, string& r
 }
 
 // Queue async translation request
-bool TranslationClient::TranslateAsync(const string& requestId, the string& text,
+bool TranslationClient::TranslateAsync(const string& requestId, const string& text,
                                        const string& sourceLang, const string& targetLang) {
     if (!initialized || !running) {
         return false;
