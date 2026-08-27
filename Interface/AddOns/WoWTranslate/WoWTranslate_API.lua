@@ -25,6 +25,7 @@ local consecutiveApiErrors = 0
 local rateLimitedUntil     = 0    -- GetTime() timestamp; 0 = not limited
 local rateLimitBackoff     = 15   -- current backoff seconds (doubles on each hit, cap 300)
 local BACKOFF_TRIGGER      = 3    -- how many consecutive API errors before backing off
+local lastError            = nil  -- last provider error reported by the DLL
 
 -- Constants
 local POLL_INTERVAL = 0.1   -- Poll every 100ms
@@ -56,6 +57,124 @@ local function strsplit(delimiter, text, limit)
 
     table.insert(result, string.sub(text, start))
     return unpack(result)
+end
+
+-- ============================================================================
+-- MINIMAL JSON READER (for the fixed provider_status shape the DLL returns)
+-- ============================================================================
+local function trim(text)
+    return string.gsub(text or "", "^%s*(.-)%s*$", "%1")
+end
+
+local function JsonUnescape(value)
+    if not value then return "" end
+
+    local result = ""
+    local i = 1
+    while i <= string.len(value) do
+        local ch = string.sub(value, i, i)
+        if ch == "\\" and i < string.len(value) then
+            local nextCh = string.sub(value, i + 1, i + 1)
+            if nextCh == "\"" then result = result .. "\""
+            elseif nextCh == "\\" then result = result .. "\\"
+            elseif nextCh == "/" then result = result .. "/"
+            elseif nextCh == "n" then result = result .. "\n"
+            elseif nextCh == "r" then result = result .. "\r"
+            elseif nextCh == "t" then result = result .. "\t"
+            elseif nextCh == "b" then result = result .. "\b"
+            elseif nextCh == "f" then result = result .. "\f"
+            elseif nextCh == "u" and i + 5 <= string.len(value) then
+                -- DLL emits UTF-8 directly for normal text; keep uncommon escapes readable.
+                result = result .. "?"
+                i = i + 4
+            else
+                result = result .. nextCh
+            end
+            i = i + 2
+        else
+            result = result .. ch
+            i = i + 1
+        end
+    end
+
+    return result
+end
+
+local function JsonGetRaw(jsonText, key)
+    if not jsonText or not key then return nil end
+
+    local search = "\"" .. key .. "\""
+    local keyStart, keyEnd = string.find(jsonText, search, 1, true)
+    if not keyStart then return nil end
+
+    local colon = string.find(jsonText, ":", keyEnd + 1, true)
+    if not colon then return nil end
+
+    local start = colon + 1
+    while start <= string.len(jsonText) do
+        local ch = string.sub(jsonText, start, start)
+        if ch ~= " " and ch ~= "\t" and ch ~= "\n" and ch ~= "\r" then
+            break
+        end
+        start = start + 1
+    end
+
+    if string.sub(jsonText, start, start) == "\"" then
+        local pos = start + 1
+        while pos <= string.len(jsonText) do
+            local ch = string.sub(jsonText, pos, pos)
+            if ch == "\\" then
+                pos = pos + 2
+            elseif ch == "\"" then
+                return string.sub(jsonText, start + 1, pos - 1), true
+            else
+                pos = pos + 1
+            end
+        end
+        return nil
+    end
+
+    local finish = start
+    while finish <= string.len(jsonText) do
+        local ch = string.sub(jsonText, finish, finish)
+        if ch == "," or ch == "}" then
+            break
+        end
+        finish = finish + 1
+    end
+
+    return trim(string.sub(jsonText, start, finish - 1)), false
+end
+
+local function JsonGetString(jsonText, key)
+    local raw, quoted = JsonGetRaw(jsonText, key)
+    if raw == nil then return nil end
+    if quoted then
+        return JsonUnescape(raw)
+    end
+    if raw == "null" then return nil end
+    return raw
+end
+
+local function JsonGetBool(jsonText, key)
+    local raw = JsonGetRaw(jsonText, key)
+    return raw == "true"
+end
+
+local function JsonGetNumber(jsonText, key)
+    local raw = JsonGetRaw(jsonText, key)
+    if raw then return tonumber(raw) end
+    return nil
+end
+
+local function ParseBridgeResult(result)
+    if result == "ok" then
+        return true, nil
+    end
+    if result and string.find(result, "error|", 1, true) == 1 then
+        return false, string.sub(result, 7)
+    end
+    return true, nil
 end
 
 -- ============================================================================
@@ -437,6 +556,105 @@ function WoWTranslate_API.ResetBackoff()
     consecutiveApiErrors = 0
     rateLimitedUntil     = 0
     rateLimitBackoff     = 15
+end
+
+-- ============================================================================
+-- PROVIDER STATUS + CONFIGURATION
+-- ============================================================================
+function WoWTranslate_API.GetLastError()
+    if dllAvailable and UnitXP then
+        local success, result = pcall(function()
+            return UnitXP("WoWTranslate", "last_error")
+        end)
+        if success and result and result ~= "" then
+            lastError = result
+        end
+    end
+    return lastError
+end
+
+function WoWTranslate_API.GetProviderStatus()
+    local status = {
+        provider = WoWTranslateDB and WoWTranslateDB.provider or "google_free",
+        configured = false,
+        ready = false,
+        endpoint = "",
+        lastHttpStatus = 0,
+    }
+
+    if not dllAvailable or not UnitXP then
+        return status
+    end
+
+    local success, result = pcall(function()
+        return UnitXP("WoWTranslate", "provider_status")
+    end)
+
+    if success and result and result ~= "" then
+        status.provider = JsonGetString(result, "provider") or status.provider
+        status.configured = JsonGetBool(result, "configured")
+        status.ready = JsonGetBool(result, "ready")
+        status.endpoint = JsonGetString(result, "endpoint") or ""
+        status.lastHttpStatus = JsonGetNumber(result, "lastHttpStatus") or 0
+    end
+
+    return status
+end
+
+-- Switches back to the free translate.googleapis.com (gtx) endpoint. No key needed.
+function WoWTranslate_API.ConfigureGoogleFree()
+    if not dllAvailable then
+        return false, "DLL not available"
+    end
+
+    local success, result = pcall(function()
+        return UnitXP("WoWTranslate", "configure_google_free")
+    end)
+
+    if not success then
+        lastError = tostring(result)
+        return false, lastError
+    end
+
+    local ok, err = ParseBridgeResult(result)
+    lastError = err
+    return ok, err
+end
+
+-- Points the translator at a user-supplied HTTPS JSON endpoint.
+--   endpoint        - required, must be https://...
+--   apiKey          - optional; sent as "<authScheme> <apiKey>" in the authHeader header
+--   authHeader      - defaults to "Authorization"
+--   authScheme      - defaults to "Bearer"; use "none" to send apiKey with no prefix
+--   requestTemplate - JSON body sent with every request; {text}/{source}/{target} are substituted
+--   responsePath    - dotted/bracketed path to the translation in the JSON response
+function WoWTranslate_API.ConfigureCustomHttp(endpoint, apiKey, authHeader, authScheme, requestTemplate, responsePath)
+    if not dllAvailable then
+        return false, "DLL not available"
+    end
+
+    if not endpoint or endpoint == "" then
+        return false, "endpoint required"
+    end
+
+    local success, result = pcall(function()
+        return UnitXP("WoWTranslate", "configure_custom",
+            endpoint,
+            apiKey or "",
+            authHeader or "Authorization",
+            authScheme or "Bearer",
+            requestTemplate or "",
+            responsePath or "translation")
+    end)
+
+    if not success then
+        lastError = tostring(result)
+        return false, lastError
+    end
+
+    local ok, err = ParseBridgeResult(result)
+    lastError = err
+    return ok, err
 end
 
 -- ============================================================================

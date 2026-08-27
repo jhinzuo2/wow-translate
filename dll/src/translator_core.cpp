@@ -1,27 +1,247 @@
 // translator_core.cpp - Translation functionality for WoWTranslate
-// Sends GET requests to translate.googleapis.com (client=gtx) — no API key required
+// Providers:
+//   GOOGLE_FREE - GET requests to translate.googleapis.com (client=gtx), no key needed (default)
+//   CUSTOM_HTTP - user-configured HTTPS JSON endpoint (self-hosted proxy, LibreTranslate, etc.)
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 
 #include <windows.h>
 #include <winhttp.h>
 #include <string>
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <codecvt>
 #include <locale>
+#include <map>
 #include <vector>
 #include <cstdio>
-#include <cstdlib>
-#include <ctime>
+#include <stdexcept>
+
+#ifdef _MSC_VER
+#pragma warning(push, 0)
+#endif
+#include "json.hpp"
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 #include "../include/translator_core.h"
 #include "../include/logging.h"
 #include "../include/utils.h"
 
 using namespace std;
+using json = nlohmann::json;
+
+namespace {
+
+string ToLowerCopy(string value) {
+    transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(tolower(c));
+    });
+    return value;
+}
+
+wstring ToWide(const string& value) {
+    return wstring(value.begin(), value.end());
+}
+
+void ReplaceAll(string& value, const string& from, const string& to) {
+    if (from.empty()) {
+        return;
+    }
+
+    size_t pos = 0;
+    while ((pos = value.find(from, pos)) != string::npos) {
+        value.replace(pos, from.length(), to);
+        pos += to.length();
+    }
+}
+
+// Escapes a value for embedding inside a JSON string literal in a request template
+// (i.e. what you'd put between the quotes). error_handler_t::replace: chat text can
+// contain invalid UTF-8 (server truncates at 255 bytes mid-character); a bare dump()
+// would throw on that, and this can run on the worker thread.
+string JsonTemplateEscape(const string& value) {
+    string dumped = json(value).dump(-1, ' ', false, json::error_handler_t::replace);
+    if (dumped.length() >= 2 && dumped.front() == '"' && dumped.back() == '"') {
+        return dumped.substr(1, dumped.length() - 2);
+    }
+    return dumped;
+}
+
+string MaskSecret(const string& value) {
+    if (value.empty()) {
+        return "";
+    }
+    if (value.length() <= 6) {
+        return "******";
+    }
+    return value.substr(0, 3) + "..." + value.substr(value.length() - 3);
+}
+
+bool IsSensitiveQueryName(const string& name) {
+    string lower = ToLowerCopy(name);
+    return lower == "key" || lower == "api_key" || lower == "apikey" ||
+           lower == "token" || lower == "access_token";
+}
+
+string MaskUrl(const string& url) {
+    size_t queryPos = url.find('?');
+    if (queryPos == string::npos) {
+        return url;
+    }
+
+    string result = url.substr(0, queryPos + 1);
+    string query = url.substr(queryPos + 1);
+    size_t pos = 0;
+    bool first = true;
+
+    while (pos <= query.length()) {
+        size_t amp = query.find('&', pos);
+        string part = (amp == string::npos) ? query.substr(pos) : query.substr(pos, amp - pos);
+        size_t eq = part.find('=');
+
+        if (!first) {
+            result += "&";
+        }
+        first = false;
+
+        if (eq != string::npos && IsSensitiveQueryName(part.substr(0, eq))) {
+            result += part.substr(0, eq + 1) + "***";
+        } else {
+            result += part;
+        }
+
+        if (amp == string::npos) {
+            break;
+        }
+        pos = amp + 1;
+    }
+
+    return result;
+}
+
+string ProviderName(TranslationProvider provider) {
+    switch (provider) {
+        case TranslationProvider::GOOGLE_FREE: return "google_free";
+        case TranslationProvider::CUSTOM_HTTP: return "custom";
+        default: return "unknown";
+    }
+}
+
+string TrimCopy(const string& value) {
+    return TrimString(value);
+}
+
+string JsonErrorMessage(const json& parsed, DWORD httpStatus) {
+    try {
+        if (parsed.contains("error")) {
+            const json& err = parsed["error"];
+            if (err.is_string()) {
+                return err.get<string>();
+            }
+            if (err.is_object() && err.contains("message") && err["message"].is_string()) {
+                return err["message"].get<string>();
+            }
+        }
+        if (parsed.contains("message") && parsed["message"].is_string()) {
+            return parsed["message"].get<string>();
+        }
+    } catch (...) {
+        // Fall through to the HTTP status fallback.
+    }
+
+    if (httpStatus > 0) {
+        return "HTTP " + to_string(httpStatus);
+    }
+    return "provider error";
+}
+
+// Resolves a dotted / bracketed path like "data.translations[0].translatedText"
+// against a parsed JSON response.
+bool ExtractJsonPath(const json& root, const string& path, string& outValue) {
+    if (path.empty()) {
+        return false;
+    }
+
+    const json* current = &root;
+    size_t pos = 0;
+
+    while (pos < path.length()) {
+        size_t dot = path.find('.', pos);
+        string segment = (dot == string::npos) ? path.substr(pos) : path.substr(pos, dot - pos);
+        pos = (dot == string::npos) ? path.length() : dot + 1;
+
+        if (segment.empty()) {
+            return false;
+        }
+
+        size_t bracket = segment.find('[');
+        string objectKey = bracket == string::npos ? segment : segment.substr(0, bracket);
+
+        if (!objectKey.empty()) {
+            if (!current->is_object() || !current->contains(objectKey)) {
+                return false;
+            }
+            current = &(*current)[objectKey];
+        }
+
+        while (bracket != string::npos) {
+            size_t close = segment.find(']', bracket + 1);
+            if (close == string::npos) {
+                return false;
+            }
+
+            string indexText = segment.substr(bracket + 1, close - bracket - 1);
+            if (indexText.empty()) {
+                return false;
+            }
+
+            int index = atoi(indexText.c_str());
+            if (!current->is_array() || index < 0 || static_cast<size_t>(index) >= current->size()) {
+                return false;
+            }
+            current = &(*current)[static_cast<size_t>(index)];
+            bracket = segment.find('[', close + 1);
+        }
+    }
+
+    if (current->is_string()) {
+        outValue = current->get<string>();
+    } else if (current->is_number() || current->is_boolean()) {
+        outValue = current->dump();
+    } else {
+        return false;
+    }
+
+    return !outValue.empty();
+}
+
+string IniValue(const map<string, map<string, string>>& ini,
+                const string& section,
+                const string& key,
+                const string& defaultValue = "") {
+    auto secIt = ini.find(ToLowerCopy(section));
+    if (secIt == ini.end()) {
+        return defaultValue;
+    }
+
+    auto keyIt = secIt->second.find(ToLowerCopy(key));
+    if (keyIt == secIt->second.end()) {
+        return defaultValue;
+    }
+
+    return keyIt->second;
+}
 
 // UTF-8 codepoint encoder (file-scope for use in multiple places)
-static string ConvertCodepointToUTF8(unsigned int codepoint) {
+string ConvertCodepointToUTF8(unsigned int codepoint) {
     string result;
     if (codepoint <= 0x7F) {
         result += static_cast<char>(codepoint);
@@ -41,119 +261,30 @@ static string ConvertCodepointToUTF8(unsigned int codepoint) {
     return result;
 }
 
-// Simple JSON parser for proxy server responses
-class SimpleJsonParser {
-public:
-    static string extractField(const string& json, const string& fieldName) {
-        string searchKey = "\"" + fieldName + "\"";
-        size_t keyPos = json.find(searchKey);
-        if (keyPos == string::npos) {
-            return "";
-        }
-
-        size_t colonPos = json.find(":", keyPos + searchKey.length());
-        if (colonPos == string::npos) {
-            return "";
-        }
-
-        size_t start = colonPos + 1;
-        while (start < json.length() && (json[start] == ' ' || json[start] == '\t' || json[start] == '\n' || json[start] == '\r')) {
-            start++;
-        }
-
-        if (start >= json.length()) {
-            return "";
-        }
-
-        // Check if it's a string value (starts with quote)
-        if (json[start] == '"') {
-            start++;
-            size_t end = start;
-            while (end < json.length() && json[end] != '"') {
-                if (json[end] == '\\' && end + 1 < json.length()) {
-                    end += 2; // Skip escaped character
-                } else {
-                    end++;
-                }
-            }
-            return unescapeJson(json.substr(start, end - start));
-        }
-
-        // It's a number or boolean
-        size_t end = start;
-        while (end < json.length() && json[end] != ',' && json[end] != '}' && json[end] != '\n') {
-            end++;
-        }
-        string value = json.substr(start, end - start);
-        // Trim whitespace
-        while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '\r')) {
-            value.pop_back();
-        }
-        return value;
+// Opts the session into HTTP/2 where the SDK/OS supports it (WinHTTP defaults to
+// HTTP/1.1 unless asked otherwise). Real browsers use HTTP/2 for this domain, and
+// a plain HTTP/1.1 request is itself one of the signals Google's abuse detection
+// on the free gtx endpoint can key off — this makes the DLL's traffic look closer
+// to what Invoke-WebRequest/a real browser sends. Best-effort: silently no-ops on
+// SDKs/OS builds that don't support the option, since WINHTTP_PROTOCOL_FLAG_HTTP2
+// was only added in the Windows 10 SDK.
+void EnableHttp2(HINTERNET hSession) {
+#ifdef WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL_FLAGS
+    if (!hSession) {
+        return;
     }
 
-    static double extractNumber(const string& json, const string& fieldName) {
-        string value = extractField(json, fieldName);
-        if (value.empty()) return -1;
-        try {
-            return stod(value);
-        } catch (...) {
-            return -1;
-        }
+    DWORD protocols = WINHTTP_PROTOCOL_FLAG_HTTP2;
+    if (!WinHttpSetOption(hSession, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL_FLAGS,
+                          &protocols, sizeof(protocols))) {
+        LOG_WARNING("WinHTTP HTTP/2 opt-in not supported by this SDK/OS (falling back to HTTP/1.1)");
     }
+#else
+    (void)hSession;
+#endif
+}
 
-private:
-    static string unescapeJson(const string& input) {
-        string result = input;
-        size_t pos = 0;
-
-        // Unescape basic characters
-        while ((pos = result.find("\\\"", pos)) != string::npos) {
-            result.replace(pos, 2, "\"");
-            pos += 1;
-        }
-        pos = 0;
-        while ((pos = result.find("\\\\", pos)) != string::npos) {
-            result.replace(pos, 2, "\\");
-            pos += 1;
-        }
-        pos = 0;
-        while ((pos = result.find("\\n", pos)) != string::npos) {
-            result.replace(pos, 2, "\n");
-            pos += 1;
-        }
-        pos = 0;
-        while ((pos = result.find("\\r", pos)) != string::npos) {
-            result.replace(pos, 2, "\r");
-            pos += 1;
-        }
-        pos = 0;
-        while ((pos = result.find("\\t", pos)) != string::npos) {
-            result.replace(pos, 2, "\t");
-            pos += 1;
-        }
-
-        // Handle Unicode escape sequences \uXXXX
-        pos = 0;
-        while ((pos = result.find("\\u", pos)) != string::npos) {
-            if (pos + 5 < result.length()) {
-                string hexStr = result.substr(pos + 2, 4);
-                try {
-                    unsigned int codepoint = stoul(hexStr, nullptr, 16);
-                    string utf8_char = ConvertCodepointToUTF8(codepoint);
-                    result.replace(pos, 6, utf8_char);
-                    pos += utf8_char.length();
-                } catch (...) {
-                    pos += 6;
-                }
-            } else {
-                break;
-            }
-        }
-
-        return result;
-    }
-};
+} // namespace
 
 // Global variables
 unique_ptr<TranslationClient> g_translator = nullptr;
@@ -161,7 +292,15 @@ char g_translation_buffer[4096] = {0};
 char g_error_buffer[256] = {0};
 
 TranslationClient::TranslationClient()
-    : hSession(nullptr), hConnect(nullptr), initialized(false), running(false) {
+    : hSession(nullptr),
+      hConnect(nullptr),
+      initialized(false),
+      provider(TranslationProvider::GOOGLE_FREE),
+      customAuthHeader("Authorization"),
+      customAuthScheme("Bearer"),
+      customResponsePath("translation"),
+      lastHttpStatus(0),
+      running(false) {
 }
 
 TranslationClient::~TranslationClient() {
@@ -169,38 +308,38 @@ TranslationClient::~TranslationClient() {
 }
 
 bool TranslationClient::Initialize() {
-    if (initialized) Cleanup();
+    return ConfigureGoogleFree();
+}
+
+bool TranslationClient::ConfigureGoogleFree() {
+    Cleanup();
+
+    {
+        lock_guard<mutex> lock(configMutex);
+        provider = TranslationProvider::GOOGLE_FREE;
+        lastHttpStatus = 0;
+    }
 
     const std::string host = "translate.googleapis.com";
     const int port = 443;
 
     LOG_INFO("Initializing Google Free translation client");
 
-    // Seed jitter for backoff randomness
-    srand((unsigned)time(nullptr));
-
-    // NOTE: The session-level "product name" here doubles as the default
-    // User-Agent for every request on this session unless a request
-    // explicitly overrides it. Using a self-identifying string like
-    // "WoWTranslate/1.0" flags this as a non-browser client to Google's
-    // abuse detection on the undocumented gtx endpoint, which can trigger
-    // 429s almost immediately. Use a realistic browser UA here so any
-    // request that (for whatever reason) doesn't get its per-request
-    // override still looks like ordinary browser traffic.
-    hSession = WinHttpOpen(
-        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        L"(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS,
-        0);
+    hSession = WinHttpOpen(L"WoWTranslate/1.0",
+                           WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                           WINHTTP_NO_PROXY_NAME,
+                           WINHTTP_NO_PROXY_BYPASS,
+                           0);
     if (!hSession) {
+        SetLastError("failed to initialize WinHTTP");
         LOG_ERROR("Failed to initialize WinHTTP session");
         return false;
     }
 
     // 8-second timeouts so a blocked/unreachable endpoint fails fast
     WinHttpSetTimeouts(hSession, 8000, 8000, 8000, 8000);
+
+    EnableHttp2(hSession);
 
     wstring wHost(host.begin(), host.end());
     hConnect = WinHttpConnect(hSession, wHost.c_str(),
@@ -215,10 +354,126 @@ bool TranslationClient::Initialize() {
     running = true;
     workerThread = thread(&TranslationClient::WorkerThreadFunc, this);
     initialized = true;
+    SetLastError("");
     LOG_INFO("Google Free translation client initialized");
     return true;
 }
 
+bool TranslationClient::ConfigureCustomHttp(const string& endpoint,
+                                            const string& apiKey,
+                                            const string& authHeader,
+                                            const string& authScheme,
+                                            const string& requestTemplate,
+                                            const string& responsePath) {
+    ParsedUrl parsed = ParseUrl(endpoint);
+    if (!parsed.valid) {
+        SetLastError("Custom endpoint must be a valid HTTPS URL");
+        return false;
+    }
+
+    Cleanup();
+
+    {
+        lock_guard<mutex> lock(configMutex);
+        provider = TranslationProvider::CUSTOM_HTTP;
+        customEndpoint = endpoint;
+        customApiKey = apiKey;
+        customAuthHeader = authHeader.empty() ? "Authorization" : authHeader;
+        customAuthScheme = authScheme;
+        customRequestTemplate = requestTemplate.empty()
+            ? "{\"text\":\"{text}\",\"source\":\"{source}\",\"target\":\"{target}\"}"
+            : requestTemplate;
+        customResponsePath = responsePath.empty() ? "translation" : responsePath;
+        lastHttpStatus = 0;
+    }
+
+    // The custom provider opens a fresh connection per request (HttpsJsonRequest), so all
+    // it needs up front is a plain WinHTTP session — no fixed hConnect like Google Free.
+    LOG_INFO("Initializing custom HTTP translation client: " + MaskUrl(endpoint));
+
+    hSession = WinHttpOpen(L"WoWTranslate/1.0",
+                           WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                           WINHTTP_NO_PROXY_NAME,
+                           WINHTTP_NO_PROXY_BYPASS,
+                           0);
+    if (!hSession) {
+        SetLastError("failed to initialize WinHTTP");
+        LOG_ERROR("Failed to initialize WinHTTP session");
+        return false;
+    }
+
+    WinHttpSetTimeouts(hSession, 5000, 5000, 15000, 30000);
+    EnableHttp2(hSession);
+
+    running = true;
+    workerThread = thread(&TranslationClient::WorkerThreadFunc, this);
+    initialized = true;
+    SetLastError("");
+    LOG_INFO("Custom HTTP translation client initialized");
+    return true;
+}
+
+bool TranslationClient::LoadConfigFromIni() {
+    string dllPath = GetDllPath();
+    if (dllPath.empty()) {
+        return false;
+    }
+
+    size_t slash = dllPath.find_last_of("\\/");
+    string dllDir = slash == string::npos ? "." : dllPath.substr(0, slash);
+    string iniPath = dllDir + "\\WoWTranslate.ini";
+
+    ifstream iniFile(iniPath);
+    if (!iniFile.is_open()) {
+        LOG_INFO("No WoWTranslate.ini found next to DLL");
+        return false;
+    }
+
+    map<string, map<string, string>> ini;
+    string section;
+    string line;
+
+    while (getline(iniFile, line)) {
+        line = TrimCopy(line);
+        if (line.empty() || line[0] == ';' || line[0] == '#') {
+            continue;
+        }
+
+        if (line.front() == '[' && line.back() == ']') {
+            section = ToLowerCopy(TrimCopy(line.substr(1, line.length() - 2)));
+            continue;
+        }
+
+        size_t eq = line.find('=');
+        if (eq == string::npos || section.empty()) {
+            continue;
+        }
+
+        string key = ToLowerCopy(TrimCopy(line.substr(0, eq)));
+        string value = TrimCopy(line.substr(eq + 1));
+        ini[section][key] = value;
+    }
+
+    string type = ToLowerCopy(IniValue(ini, "provider", "type", "google_free"));
+    LOG_INFO("Loading provider configuration from WoWTranslate.ini: " + type);
+
+    if (type == "google_free" || type == "googlefree" || type == "free") {
+        return ConfigureGoogleFree();
+    }
+
+    if (type == "custom") {
+        return ConfigureCustomHttp(
+            IniValue(ini, "custom", "endpoint"),
+            IniValue(ini, "custom", "api_key"),
+            IniValue(ini, "custom", "auth_header", "Authorization"),
+            IniValue(ini, "custom", "auth_scheme", "Bearer"),
+            IniValue(ini, "custom", "request_template"),
+            IniValue(ini, "custom", "response_path", "translation"));
+    }
+
+    SetLastError("unknown provider in WoWTranslate.ini: " + type);
+    return false;
+}
 
 void TranslationClient::Cleanup() {
     // Stop worker thread
@@ -239,9 +494,69 @@ void TranslationClient::Cleanup() {
         hSession = nullptr;
     }
 
+    {
+        lock_guard<mutex> lock(requestMutex);
+        queue<AsyncRequest> empty;
+        swap(requestQueue, empty);
+    }
+
+    {
+        lock_guard<mutex> lock(resultMutex);
+        queue<AsyncResult> empty;
+        swap(resultQueue, empty);
+    }
+
     cache.clear();
     initialized = false;
     LOG_INFO("Translation client cleanup complete");
+}
+
+string TranslationClient::GetProviderName() const {
+    lock_guard<mutex> lock(configMutex);
+    return ProviderName(provider);
+}
+
+string TranslationClient::GetProviderEndpoint() const {
+    lock_guard<mutex> lock(configMutex);
+    if (provider == TranslationProvider::GOOGLE_FREE) {
+        return "https://translate.googleapis.com/translate_a/single (free, no key)";
+    }
+    return MaskUrl(customEndpoint);
+}
+
+string TranslationClient::GetProviderStatusJson() const {
+    lock_guard<mutex> lock(configMutex);
+
+    string endpoint = (provider == TranslationProvider::GOOGLE_FREE)
+        ? "https://translate.googleapis.com/translate_a/single (free, no key)"
+        : MaskUrl(customEndpoint);
+
+    bool configured = (provider == TranslationProvider::GOOGLE_FREE)
+        ? true
+        : (!customEndpoint.empty() && !customRequestTemplate.empty() && !customResponsePath.empty());
+
+    json status;
+    status["provider"] = ProviderName(provider);
+    status["configured"] = configured;
+    status["ready"] = initialized;
+    status["endpoint"] = endpoint;
+    status["lastHttpStatus"] = lastHttpStatus;
+    return status.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+string TranslationClient::GetLastError() const {
+    lock_guard<mutex> lock(configMutex);
+    return lastError;
+}
+
+void TranslationClient::SetLastError(const string& error) {
+    lock_guard<mutex> lock(configMutex);
+    lastError = error;
+}
+
+void TranslationClient::SetLastHttpStatus(DWORD status) {
+    lock_guard<mutex> lock(configMutex);
+    lastHttpStatus = status;
 }
 
 string TranslationClient::UrlEncode(const string& text) {
@@ -263,7 +578,7 @@ string TranslationClient::UrlEncode(const string& text) {
 }
 
 string TranslationClient::GenerateCacheKey(const string& text, const string& sourceLang, const string& targetLang) {
-    return sourceLang + "->" + targetLang + ":" + text;
+    return ProviderName(provider) + ":" + sourceLang + "->" + targetLang + ":" + text;
 }
 
 void TranslationClient::CleanExpiredCache() {
@@ -292,136 +607,244 @@ string TranslationClient::MapLangCode(const string& lang) {
     return lang;
 }
 
-// Updated HttpsGet: adds realistic browser headers and simple exponential-backoff retries.
-// Note: we do NOT add Accept-Encoding here to avoid needing decompression; if you add it,
-// implement decompression (gzip/deflate/br) or enable WinHTTP decompression options.
 string TranslationClient::HttpsGet(const string& path) {
     if (!hConnect) return "";
 
     wstring wPath(path.begin(), path.end());
 
-    const int maxRetries = 4;
-    int attempt = 0;
-    int backoffMs = 500; // initial backoff
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect, L"GET", wPath.c_str(), nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
 
-    while (attempt < maxRetries) {
-        attempt++;
+    if (!hRequest) {
+        LOG_ERROR("Failed to open GET request");
+        return "";
+    }
 
-        HINTERNET hRequest = WinHttpOpenRequest(
-            hConnect, L"GET", wPath.c_str(), nullptr,
-            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-            WINHTTP_FLAG_SECURE);
+    // Look like a real browser hitting this endpoint (bare "Mozilla/5.0" with no
+    // Accept-Language/Accept-Encoding is itself a bot signal to Google's abuse
+    // detection on the free gtx endpoint — see the WoWTranslate.log 429 discussion).
+    wstring headers =
+        L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        L"(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36\r\n"
+        L"Accept: */*\r\n"
+        L"Accept-Language: en-US,en;q=0.9\r\n";
+    WinHttpAddRequestHeaders(hRequest, headers.c_str(), (DWORD)-1,
+                             WINHTTP_ADDREQ_FLAG_ADD);
 
-        if (!hRequest) {
-            LOG_ERROR("Failed to open GET request");
-            return "";
+    // Only claim Accept-Encoding: gzip/br if WinHTTP can actually decompress the
+    // response for us (WINHTTP_OPTION_DECOMPRESSION, Win 8.1+ SDK) — otherwise
+    // ParseGoogleFreeResponse's plain-text scan for "[[[" would silently fail
+    // against a compressed body it can't read.
+#ifdef WINHTTP_OPTION_DECOMPRESSION
+    DWORD decompression = WINHTTP_DECOMPRESSION_FLAG_ALL;
+    if (WinHttpSetOption(hRequest, WINHTTP_OPTION_DECOMPRESSION, &decompression, sizeof(decompression))) {
+        wstring acceptEncoding = L"Accept-Encoding: gzip, deflate, br\r\n";
+        WinHttpAddRequestHeaders(hRequest, acceptEncoding.c_str(), (DWORD)-1,
+                                 WINHTTP_ADDREQ_FLAG_ADD);
+    }
+#endif
+
+    BOOL result = WinHttpSendRequest(hRequest,
+                                     WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                     nullptr, 0, 0, 0);
+
+    string response;
+    if (result && WinHttpReceiveResponse(hRequest, nullptr)) {
+        // Read HTTP status code before consuming the body.
+        // A 429 response has an unparseable body; surface it explicitly
+        // so the Lua side can trigger immediate backoff rather than treating
+        // it as a generic API parse failure.
+        DWORD statusCode = 0;
+        DWORD statusLen  = sizeof(DWORD);
+        WinHttpQueryHeaders(hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &statusCode, &statusLen,
+            WINHTTP_NO_HEADER_INDEX);
+        SetLastHttpStatus(statusCode);
+        if (statusCode == 429) {
+            LOG_WARNING("Rate limited by Google (HTTP 429)");
+            WinHttpCloseHandle(hRequest);
+            return "HTTP_429";
         }
 
-        // More realistic browser headers to reduce fingerprinting
-        wstring headers =
-            L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            L"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n"
-            L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\n"
-            L"Accept-Language: en-US,en;q=0.9\r\n"
-            // Do NOT add Accept-Encoding here unless you implement decompression below.
-            L"Referer: https://translate.google.com/\r\n"
-            L"Origin: https://translate.google.com\r\n"
-            L"Connection: keep-alive\r\n";
-
-        WinHttpAddRequestHeaders(hRequest, headers.c_str(), (DWORD)-1,
-                                 WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-
-        BOOL result = WinHttpSendRequest(hRequest,
-                                         WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                         nullptr, 0, 0, 0);
-
-        string response;
-        if (result && WinHttpReceiveResponse(hRequest, nullptr)) {
-            // Read HTTP status code before consuming the body.
-            DWORD statusCode = 0;
-            DWORD statusLen  = sizeof(DWORD);
-            WinHttpQueryHeaders(hRequest,
-                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                WINHTTP_HEADER_NAME_BY_INDEX,
-                &statusCode, &statusLen,
-                WINHTTP_NO_HEADER_INDEX);
-
-            if (statusCode == 429) {
-                LOG_WARNING("Rate limited by Google (HTTP 429) on attempt " + to_string(attempt));
-
-                // Try to read Retry-After header (if present) and respect it
-                DWORD headerSize = 0;
-                if (!WinHttpQueryHeaders(hRequest,
-                        WINHTTP_QUERY_RETRY_AFTER,
-                        WINHTTP_HEADER_NAME_BY_INDEX,
-                        nullptr, &headerSize, WINHTTP_NO_HEADER_INDEX)) {
-                    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && headerSize > 0) {
-                        std::vector<wchar_t> buf(headerSize / sizeof(wchar_t) + 1);
-                        if (WinHttpQueryHeaders(hRequest,
-                                WINHTTP_QUERY_RETRY_AFTER,
-                                WINHTTP_HEADER_NAME_BY_INDEX,
-                                buf.data(), &headerSize, WINHTTP_NO_HEADER_INDEX)) {
-                            wstring wRetry(buf.data());
-                            int secs = _wtoi(wRetry.c_str());
-                            if (secs > 0) {
-                                WinHttpCloseHandle(hRequest);
-                                Sleep(secs * 1000);
-                                // If this was the last attempt, return HTTP_429 so caller can back off permanently
-                                if (attempt >= maxRetries) return "HTTP_429";
-                                backoffMs *= 2;
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                WinHttpCloseHandle(hRequest);
-
-                if (attempt >= maxRetries) {
-                    return "HTTP_429";
-                }
-
-                // Exponential backoff with small jitter
-                int jitter = rand() % 200; // 0..199 ms
-                Sleep(backoffMs + jitter);
-                backoffMs *= 2;
-                continue;
+        DWORD bytesAvailable = 0;
+        char buffer[8192];
+        while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable)
+               && bytesAvailable > 0) {
+            DWORD bytesRead = 0;
+            DWORD bytesToRead = min(bytesAvailable, (DWORD)(sizeof(buffer) - 1));
+            if (WinHttpReadData(hRequest, buffer, bytesToRead, &bytesRead)) {
+                buffer[bytesRead] = '\0';
+                response += string(buffer, bytesRead);
+            } else {
+                break;
             }
+        }
+    } else {
+        LOG_ERROR("GET request failed: " + to_string(::GetLastError()));
+    }
 
-            DWORD bytesAvailable = 0;
-            char buffer[8192];
-            while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable)
-                   && bytesAvailable > 0) {
-                DWORD bytesRead = 0;
-                DWORD bytesToRead = min(bytesAvailable, (DWORD)(sizeof(buffer) - 1));
-                if (WinHttpReadData(hRequest, buffer, bytesToRead, &bytesRead)) {
-                    buffer[bytesRead] = '\0';
-                    response += string(buffer, bytesRead);
-                } else {
-                    break;
-                }
-            }
+    WinHttpCloseHandle(hRequest);
+    return response;
+}
 
-            WinHttpCloseHandle(hRequest);
+// Generic HTTPS JSON request used by the custom provider: opens its own connection
+// scoped to whatever host the configured endpoint points at (unlike HttpsGet, which
+// only ever talks to the persistent Google Free hConnect).
+string TranslationClient::HttpsJsonRequest(const ParsedUrl& url,
+                                           const string& postData,
+                                           const vector<pair<string, string>>& headers,
+                                           DWORD& statusCode,
+                                           bool useGet) {
+    statusCode = 0;
 
-            // Success: return response (may be empty if server sent empty body)
-            return response;
-        } else {
-            DWORD err = GetLastError();
-            LOG_ERROR("GET request failed (attempt " + to_string(attempt) + "): " + to_string(err));
-            WinHttpCloseHandle(hRequest);
+    if (!hSession || !url.valid) {
+        SetLastError("HTTP runtime is not ready");
+        return "";
+    }
 
-            if (attempt >= maxRetries) break;
+    wstring wHost = ToWide(url.host);
+    HINTERNET hReqConnect = WinHttpConnect(hSession,
+                                           wHost.c_str(),
+                                           static_cast<INTERNET_PORT>(url.port),
+                                           0);
+    if (!hReqConnect) {
+        DWORD err = ::GetLastError();
+        SetLastError("failed to connect to " + url.host + " (" + to_string(err) + ")");
+        LOG_ERROR("WinHttpConnect failed for " + url.host + ": " + to_string(err));
+        return "";
+    }
 
-            int jitter = rand() % 200;
-            Sleep(backoffMs + jitter);
-            backoffMs *= 2;
-            continue;
+    wstring wPath = ToWide(url.pathAndQuery);
+    HINTERNET hRequest = WinHttpOpenRequest(hReqConnect,
+                                            useGet ? L"GET" : L"POST",
+                                            wPath.c_str(),
+                                            nullptr,
+                                            WINHTTP_NO_REFERER,
+                                            WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                            WINHTTP_FLAG_SECURE);
+
+    if (!hRequest) {
+        DWORD err = ::GetLastError();
+        WinHttpCloseHandle(hReqConnect);
+        SetLastError("failed to open HTTP request (" + to_string(err) + ")");
+        LOG_ERROR("WinHttpOpenRequest failed: " + to_string(err));
+        return "";
+    }
+
+    string headerText = useGet ? "" : "Content-Type: application/json\r\n";
+    headerText += "Accept: application/json\r\n";
+    for (const auto& header : headers) {
+        if (!header.first.empty() && !header.second.empty()) {
+            headerText += header.first + ": " + header.second + "\r\n";
         }
     }
 
-    // Exhausted retries
-    return "";
+    wstring wHeaders = ToWide(headerText);
+    if (!WinHttpAddRequestHeaders(hRequest, wHeaders.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD)) {
+        LOG_WARNING("WinHttpAddRequestHeaders failed");
+    }
+
+    LOG_DEBUG(string(useGet ? "GET" : "POST") + " https://" + url.host + ":" + to_string(url.port) + MaskUrl(url.pathAndQuery));
+
+    BOOL sent = WinHttpSendRequest(hRequest,
+                                   WINHTTP_NO_ADDITIONAL_HEADERS,
+                                   0,
+                                   (useGet || postData.empty()) ? WINHTTP_NO_REQUEST_DATA : (LPVOID)postData.c_str(),
+                                   useGet ? 0 : static_cast<DWORD>(postData.length()),
+                                   useGet ? 0 : static_cast<DWORD>(postData.length()),
+                                   0);
+
+    string response;
+    if (sent && WinHttpReceiveResponse(hRequest, nullptr)) {
+        DWORD statusSize = sizeof(statusCode);
+        WinHttpQueryHeaders(hRequest,
+                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX,
+                            &statusCode,
+                            &statusSize,
+                            WINHTTP_NO_HEADER_INDEX);
+        SetLastHttpStatus(statusCode);
+
+        DWORD bytesAvailable = 0;
+        char buffer[8192];
+
+        while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable) && bytesAvailable > 0) {
+            DWORD bytesRead = 0;
+            DWORD bytesToRead = std::min(bytesAvailable, static_cast<DWORD>(sizeof(buffer)));
+
+            if (!WinHttpReadData(hRequest, buffer, bytesToRead, &bytesRead) || bytesRead == 0) {
+                break;
+            }
+
+            response.append(buffer, bytesRead);
+        }
+    } else {
+        DWORD err = ::GetLastError();
+        SetLastError("HTTP request failed (" + to_string(err) + ")");
+        LOG_ERROR("HTTP request failed with WinHTTP error: " + to_string(err));
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hReqConnect);
+    return response;
+}
+
+TranslationClient::ParsedUrl TranslationClient::ParseUrl(const string& url) const {
+    ParsedUrl parsed;
+    size_t schemeEnd = url.find("://");
+    if (schemeEnd == string::npos) {
+        return parsed;
+    }
+
+    parsed.scheme = ToLowerCopy(url.substr(0, schemeEnd));
+    if (parsed.scheme != "https") {
+        return parsed;
+    }
+
+    string remainder = url.substr(schemeEnd + 3);
+    size_t pathStart = remainder.find_first_of("/?");
+    string hostPort = pathStart == string::npos ? remainder : remainder.substr(0, pathStart);
+    if (pathStart == string::npos) {
+        parsed.pathAndQuery = "/";
+    } else if (remainder[pathStart] == '?') {
+        parsed.pathAndQuery = "/" + remainder.substr(pathStart);
+    } else {
+        parsed.pathAndQuery = remainder.substr(pathStart);
+    }
+
+    if (hostPort.empty()) {
+        return parsed;
+    }
+
+    size_t colon = hostPort.rfind(':');
+    if (colon != string::npos && colon + 1 < hostPort.length()) {
+        string portText = hostPort.substr(colon + 1);
+        bool allDigits = true;
+        for (char ch : portText) {
+            if (!isdigit(static_cast<unsigned char>(ch))) {
+                allDigits = false;
+                break;
+            }
+        }
+
+        if (allDigits) {
+            parsed.host = hostPort.substr(0, colon);
+            parsed.port = atoi(portText.c_str());
+        } else {
+            parsed.host = hostPort;
+            parsed.port = 443;
+        }
+    } else {
+        parsed.host = hostPort;
+        parsed.port = 443;
+    }
+
+    parsed.valid = !parsed.host.empty() && parsed.port > 0;
+    return parsed;
 }
 
 string TranslationClient::ParseGoogleFreeResponse(const string& json) {
@@ -480,24 +903,8 @@ string TranslationClient::ParseGoogleFreeResponse(const string& json) {
     return result;
 }
 
-TranslationResult TranslationClient::TranslateText(const string& text, string& result,
-                                                    const string& sourceLang,
-                                                    const string& targetLang) {
-    if (!initialized) return TranslationResult::INVALID_PARAMS;
-    if (text.empty())  return TranslationResult::INVALID_PARAMS;
-
-    // DLL-side cache check
-    string cacheKey = GenerateCacheKey(text, sourceLang, targetLang);
-    auto cacheIt = cache.find(cacheKey);
-    if (cacheIt != cache.end() &&
-        (GetTickCount() - cacheIt->second.timestamp) < CACHE_EXPIRY_MS) {
-        result = cacheIt->second.translation;
-        LOG_DEBUG("Cache hit: " + text.substr(0, 50));
-        return TranslationResult::SUCCESS;
-    }
-
-    CleanExpiredCache();
-
+TranslationResult TranslationClient::TranslateWithGoogleFree(const string& text, string& result,
+                                                              const string& sourceLang, const string& targetLang) {
     // Build Google Free GET path
     string sl = MapLangCode(sourceLang);
     string tl = MapLangCode(targetLang);
@@ -514,6 +921,8 @@ TranslationResult TranslationClient::TranslateText(const string& text, string& r
 
     if (response.empty()) {
         LOG_ERROR("Empty response from Google Free");
+        result = "network error";
+        SetLastError(result);
         return TranslationResult::NETWORK_ERROR;
     }
 
@@ -523,13 +932,139 @@ TranslationResult TranslationClient::TranslateText(const string& text, string& r
 
     if (translation.empty()) {
         LOG_ERROR("Failed to parse Google Free response");
+        result = "failed to parse Google Free response";
+        SetLastError(result);
         return TranslationResult::API_ERROR;
     }
 
-    cache[cacheKey] = CacheEntry(translation);
     result = translation;
+    SetLastError("");
     LOG_DEBUG("Translated: " + text.substr(0, 30) + " -> " + translation.substr(0, 50));
     return TranslationResult::SUCCESS;
+}
+
+TranslationResult TranslationClient::TranslateWithCustom(const string& text, string& result,
+                                                          const string& sourceLang, const string& targetLang) {
+    string endpoint;
+    string apiKey;
+    string authHeader;
+    string authScheme;
+    string requestTemplate;
+    string responsePath;
+
+    {
+        lock_guard<mutex> lock(configMutex);
+        endpoint = customEndpoint;
+        apiKey = customApiKey;
+        authHeader = customAuthHeader;
+        authScheme = customAuthScheme;
+        requestTemplate = customRequestTemplate;
+        responsePath = customResponsePath;
+    }
+
+    ParsedUrl url = ParseUrl(endpoint);
+    if (!url.valid) {
+        result = "Custom endpoint must be a valid HTTPS URL";
+        SetLastError(result);
+        return TranslationResult::INVALID_PARAMS;
+    }
+
+    string body = requestTemplate.empty()
+        ? "{\"text\":\"{text}\",\"source\":\"{source}\",\"target\":\"{target}\"}"
+        : requestTemplate;
+    ReplaceAll(body, "{text}", JsonTemplateEscape(text));
+    ReplaceAll(body, "{source}", JsonTemplateEscape(sourceLang));
+    ReplaceAll(body, "{target}", JsonTemplateEscape(targetLang));
+
+    vector<pair<string, string>> headers;
+    if (!apiKey.empty() && !authHeader.empty()) {
+        string headerValue;
+        if (authScheme.empty() || ToLowerCopy(authScheme) == "none") {
+            headerValue = apiKey;
+        } else {
+            headerValue = authScheme + " " + apiKey;
+        }
+        headers.push_back({authHeader, headerValue});
+    }
+
+    DWORD status = 0;
+    string response = HttpsJsonRequest(url, body, headers, status);
+    if (response.empty() && status == 0) {
+        result = GetLastError().empty() ? "network error" : GetLastError();
+        return TranslationResult::NETWORK_ERROR;
+    }
+
+    if (status == 429) {
+        LOG_WARNING("Rate limited by custom endpoint (HTTP 429)");
+        return TranslationResult::RATE_LIMITED;
+    }
+
+    try {
+        json parsed = json::parse(response);
+        if (status >= 400 || parsed.contains("error")) {
+            result = JsonErrorMessage(parsed, status);
+            SetLastError(result);
+            LOG_ERROR("Custom provider error: " + result);
+            return TranslationResult::API_ERROR;
+        }
+
+        if (!ExtractJsonPath(parsed, responsePath, result)) {
+            result = "Custom response did not include path: " + responsePath;
+            SetLastError(result);
+            return TranslationResult::API_ERROR;
+        }
+
+        result = TrimCopy(result);
+        SetLastError("");
+        return TranslationResult::SUCCESS;
+    } catch (const exception& e) {
+        result = string("failed to parse custom response: ") + e.what();
+        SetLastError(result);
+        return TranslationResult::API_ERROR;
+    }
+}
+
+TranslationResult TranslationClient::TranslateText(const string& text, string& result,
+                                                    const string& sourceLang,
+                                                    const string& targetLang) {
+    if (!initialized) {
+        result = "translator not initialized";
+        SetLastError(result);
+        return TranslationResult::INVALID_PARAMS;
+    }
+    if (text.empty()) {
+        result = "empty text";
+        return TranslationResult::INVALID_PARAMS;
+    }
+
+    TranslationProvider activeProvider;
+    {
+        lock_guard<mutex> lock(configMutex);
+        activeProvider = provider;
+    }
+
+    // DLL-side cache check
+    string cacheKey = GenerateCacheKey(text, sourceLang, targetLang);
+    auto cacheIt = cache.find(cacheKey);
+    if (cacheIt != cache.end() &&
+        (GetTickCount() - cacheIt->second.timestamp) < CACHE_EXPIRY_MS) {
+        result = cacheIt->second.translation;
+        LOG_DEBUG("Cache hit: " + text.substr(0, 50));
+        return TranslationResult::SUCCESS;
+    }
+
+    CleanExpiredCache();
+
+    TranslationResult tr = (activeProvider == TranslationProvider::CUSTOM_HTTP)
+        ? TranslateWithCustom(text, result, sourceLang, targetLang)
+        : TranslateWithGoogleFree(text, result, sourceLang, targetLang);
+
+    if (tr == TranslationResult::SUCCESS) {
+        cache[cacheKey] = CacheEntry(result);
+        LOG_DEBUG("Translation successful using provider: " + ProviderName(activeProvider));
+    }
+
+    return tr;
 }
 
 // Queue async translation request

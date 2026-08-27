@@ -5,6 +5,7 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#include <memory>
 
 #ifdef MINHOOK_AVAILABLE
 #include "MinHook.h"
@@ -114,9 +115,28 @@ bool lua_isstring(void* L, int index) {
     return p_lua_isstring(L, index) != 0;
 }
 
+// Pushes "ok" on success, or "error|<message>" (preferring the translator's last
+// recorded error over the generic fallback) on failure.
+static void PushConfigureResult(void* L, bool ok, const string& fallbackError) {
+    if (ok) {
+        lua_pushstring(L, "ok");
+        return;
+    }
+
+    string error = fallbackError;
+    if (g_translator && !g_translator->GetLastError().empty()) {
+        error = g_translator->GetLastError();
+    }
+    lua_pushstring(L, "error|" + error);
+}
+
 // Main WoWTranslate command handler
 // Commands:
 //   UnitXP("WoWTranslate", "ping") -> "pong"
+//   UnitXP("WoWTranslate", "configure_google_free") -> "ok" or "error|..."
+//   UnitXP("WoWTranslate", "configure_custom", endpoint, apiKey, authHeader, authScheme, template, path) -> "ok" or error
+//   UnitXP("WoWTranslate", "provider_status") -> JSON status string
+//   UnitXP("WoWTranslate", "last_error") -> last provider error
 //   UnitXP("WoWTranslate", "translate_async", requestId, text, [sourceLang], [targetLang]) -> "ok" or "error|..."
 //   UnitXP("WoWTranslate", "poll") -> "requestId|translation|error" or ""
 //   UnitXP("WoWTranslate", "status") -> status string
@@ -151,9 +171,68 @@ int __fastcall detoured_UnitXP(void* L) {
                         string status = "WoWTranslate: DLL Active, Translator ";
                         status += (g_translator && g_translator->IsInitialized()) ? "Ready" : "Not Ready";
                         if (g_translator) {
+                            status += ", Provider: " + g_translator->GetProviderName();
+                            status += ", Endpoint: " + g_translator->GetProviderEndpoint();
                             status += ", Pending: " + to_string(g_translator->GetPendingCount());
+                            if (g_translator->GetLastHttpStatus() > 0) {
+                                status += ", HTTP: " + to_string(g_translator->GetLastHttpStatus());
+                            }
+                            if (!g_translator->GetLastError().empty()) {
+                                status += ", Last error: " + g_translator->GetLastError();
+                            }
                         }
                         lua_pushstring(L, status);
+                        return 1;
+                    }
+
+                    // CONFIGURE_GOOGLE_FREE - Switch back to the free GTX endpoint
+                    else if (subcmd == "configure_google_free") {
+                        if (!g_translator) {
+                            g_translator = make_unique<TranslationClient>();
+                        }
+                        bool ok = g_translator->ConfigureGoogleFree();
+                        PushConfigureResult(L, ok, "failed to configure Google Free provider");
+                        return 1;
+                    }
+
+                    // CONFIGURE_CUSTOM - Point the translator at a user-supplied HTTPS JSON endpoint
+                    // Args: endpoint, [apiKey], [authHeader], [authScheme], [requestTemplate], [responsePath]
+                    else if (subcmd == "configure_custom") {
+                        if (lua_gettop(L) < 3) {
+                            lua_pushstring(L, "error|custom endpoint required");
+                            return 1;
+                        }
+
+                        string endpoint{ lua_tostring(L, 3) };
+                        string apiKey = lua_gettop(L) >= 4 ? lua_tostring(L, 4) : "";
+                        string authHeader = lua_gettop(L) >= 5 ? lua_tostring(L, 5) : "Authorization";
+                        string authScheme = lua_gettop(L) >= 6 ? lua_tostring(L, 6) : "Bearer";
+                        string requestTemplate = lua_gettop(L) >= 7 ? lua_tostring(L, 7) : "";
+                        string responsePath = lua_gettop(L) >= 8 ? lua_tostring(L, 8) : "translation";
+
+                        if (!g_translator) {
+                            g_translator = make_unique<TranslationClient>();
+                        }
+
+                        bool ok = g_translator->ConfigureCustomHttp(
+                            endpoint, apiKey, authHeader, authScheme, requestTemplate, responsePath);
+                        PushConfigureResult(L, ok, "failed to configure custom provider");
+                        return 1;
+                    }
+
+                    // PROVIDER_STATUS - JSON status blob: {provider, configured, ready, endpoint, lastHttpStatus}
+                    else if (subcmd == "provider_status") {
+                        if (!g_translator) {
+                            lua_pushstring(L, "{\"provider\":\"google_free\",\"configured\":true,\"ready\":false,\"endpoint\":\"\",\"lastHttpStatus\":0}");
+                        } else {
+                            lua_pushstring(L, g_translator->GetProviderStatusJson());
+                        }
+                        return 1;
+                    }
+
+                    // LAST_ERROR - Most recent provider error message, if any
+                    else if (subcmd == "last_error") {
+                        lua_pushstring(L, g_translator ? g_translator->GetLastError() : "");
                         return 1;
                     }
 

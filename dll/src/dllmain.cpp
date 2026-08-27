@@ -41,9 +41,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             return FALSE;
         }
 
-        // Connect to Google Free endpoint immediately — no API key needed
-        if (!g_translator->Initialize()) {
-            LOG_WARNING("Translation client failed to initialize at load time");
+        // Load WoWTranslate.ini next to the DLL if present (lets a custom HTTPS
+        // endpoint be configured without in-game commands); otherwise fall back
+        // to the Google Free endpoint immediately — no API key needed.
+        if (!g_translator->LoadConfigFromIni()) {
+            if (!g_translator->ConfigureGoogleFree()) {
+                LOG_WARNING("Translation client failed to initialize at load time");
+            }
         }
 
         // Initialize Lua interface

@@ -1,0 +1,29 @@
+; WoWTranslate configuration (optional)
+; Copy this file to WoWTranslate.ini next to WoWTranslate.dll and edit.
+; Everything here can also be set in game with /wt commands.
+
+[provider]
+; one of: google_free (no key needed, default), custom
+type = google_free
+
+[custom]
+; any HTTPS JSON endpoint (e.g. a self-hosted proxy or LibreTranslate) that accepts
+; a POST body and returns a JSON response containing the translation.
+endpoint =
+
+; Sent as "<auth_scheme> <api_key>" in the "<auth_header>" request header, e.g.
+; "Authorization: Bearer sk-...". Leave api_key empty to send no auth header at all.
+; Set auth_scheme to "none" to send the raw api_key with no scheme prefix.
+api_key =
+auth_header = Authorization
+auth_scheme = Bearer
+
+; The JSON body sent with every request. {text}, {source}, and {target} are
+; substituted with the message, source language code, and target language code
+; (each already JSON-string-escaped for you — do not wrap them in extra quotes
+; beyond what's shown below).
+request_template = {"text":"{text}","source":"{source}","target":"{target}"}
+
+; Dotted/bracketed path into the JSON response where the translated string lives,
+; e.g. "translation", "data.translations[0].translatedText", "choices[0].message.content".
+response_path = translation

@@ -162,6 +162,14 @@ local defaults = {
     nameplateNameColor = "",     -- Hex RRGGBB base name color on Shagu plates when Colored names is off
     nameplateGuildColor = "",    -- Hex RRGGBB base guild line color on Shagu plates
     playerNameClassColor = true,  -- Class color for friendly players; hostile players stay red
+    -- Translation provider settings
+    provider = "google_free",              -- "google_free" (default, no key needed) or "custom"
+    customEndpoint = "",                   -- HTTPS URL of a user-configured JSON translation endpoint
+    customApiKey = "",
+    customAuthHeader = "Authorization",
+    customAuthScheme = "Bearer",
+    customRequestTemplate = "",             -- empty = DLL default: {"text":"{text}","source":"{source}","target":"{target}"}
+    customResponsePath = "translation",     -- dotted/bracketed path to the translation in the JSON response
 }
 
 -- ============================================================================
@@ -5918,6 +5926,110 @@ SlashCmdList["WOWTRANSLATE"] = function(msg)
             DEFAULT_CHAT_FRAME:AddMessage("|cFF00FF00[WT hooktest] Hook is firing correctly|r")
         end
 
+    -- =====================================================================
+    -- TRANSLATION PROVIDER COMMANDS
+    -- =====================================================================
+    elseif cmd == "provider" then
+        local sub = arg or ""
+        if sub == "" then
+            local status = WoWTranslate_API.GetProviderStatus()
+            local readyText = status.ready and "|cFF00FF00ready|r" or "|cFFFF0000not ready|r"
+            DEFAULT_CHAT_FRAME:AddMessage("[WoWTranslate] Provider: " .. status.provider .. " (" .. readyText .. ")")
+            DEFAULT_CHAT_FRAME:AddMessage("  Endpoint: " .. (status.endpoint ~= "" and status.endpoint or "n/a"))
+            if status.lastHttpStatus and status.lastHttpStatus > 0 then
+                DEFAULT_CHAT_FRAME:AddMessage("  Last HTTP status: " .. tostring(status.lastHttpStatus))
+            end
+            local lastErr = WoWTranslate_API.GetLastError()
+            if lastErr and lastErr ~= "" then
+                DEFAULT_CHAT_FRAME:AddMessage("  Last error: " .. lastErr)
+            end
+            DEFAULT_CHAT_FRAME:AddMessage("  Usage: /wt provider google_free|custom")
+
+        elseif sub == "google_free" or sub == "google" or sub == "free" then
+            local ok, err = WoWTranslate_API.ConfigureGoogleFree()
+            if ok then
+                WoWTranslateDB.provider = "google_free"
+                DEFAULT_CHAT_FRAME:AddMessage("|cFF00FF00[WoWTranslate] Switched to Google Free (no key needed)|r")
+            else
+                DEFAULT_CHAT_FRAME:AddMessage("|cFFFF0000[WoWTranslate] Failed to switch provider: " .. tostring(err) .. "|r")
+            end
+
+        elseif sub == "custom" then
+            if not WoWTranslateDB.customEndpoint or WoWTranslateDB.customEndpoint == "" then
+                DEFAULT_CHAT_FRAME:AddMessage("|cFFFF0000[WoWTranslate] Set an endpoint first: /wt customendpoint https://...|r")
+                return
+            end
+            local ok, err = WoWTranslate_API.ConfigureCustomHttp(
+                WoWTranslateDB.customEndpoint,
+                WoWTranslateDB.customApiKey,
+                WoWTranslateDB.customAuthHeader,
+                WoWTranslateDB.customAuthScheme,
+                WoWTranslateDB.customRequestTemplate,
+                WoWTranslateDB.customResponsePath)
+            if ok then
+                WoWTranslateDB.provider = "custom"
+                DEFAULT_CHAT_FRAME:AddMessage("|cFF00FF00[WoWTranslate] Switched to custom endpoint: " .. WoWTranslateDB.customEndpoint .. "|r")
+            else
+                DEFAULT_CHAT_FRAME:AddMessage("|cFFFF0000[WoWTranslate] Failed to switch provider: " .. tostring(err) .. "|r")
+            end
+
+        else
+            DEFAULT_CHAT_FRAME:AddMessage("|cFFFF0000[WoWTranslate] Unknown provider: " .. sub .. "|r")
+            DEFAULT_CHAT_FRAME:AddMessage("  Usage: /wt provider google_free|custom")
+        end
+
+    elseif cmd == "customendpoint" then
+        if arg and arg ~= "" then
+            WoWTranslateDB.customEndpoint = arg
+            DEFAULT_CHAT_FRAME:AddMessage("[WoWTranslate] Custom endpoint set to: " .. arg)
+            DEFAULT_CHAT_FRAME:AddMessage("  Run /wt provider custom to switch to it")
+        else
+            DEFAULT_CHAT_FRAME:AddMessage("[WoWTranslate] Current custom endpoint: " .. (WoWTranslateDB.customEndpoint ~= "" and WoWTranslateDB.customEndpoint or "(not set)"))
+            DEFAULT_CHAT_FRAME:AddMessage("  Usage: /wt customendpoint https://your-endpoint.example.com/translate")
+        end
+
+    elseif cmd == "customkey" then
+        if arg and arg ~= "" then
+            WoWTranslateDB.customApiKey = arg
+            DEFAULT_CHAT_FRAME:AddMessage("[WoWTranslate] Custom API key set (" .. string.len(arg) .. " chars)")
+        else
+            WoWTranslateDB.customApiKey = ""
+            DEFAULT_CHAT_FRAME:AddMessage("[WoWTranslate] Custom API key cleared")
+        end
+        DEFAULT_CHAT_FRAME:AddMessage("  Re-run /wt provider custom to apply")
+
+    elseif cmd == "customauth" then
+        local header, scheme = strsplit(" ", arg or "", 2)
+        if header and header ~= "" then
+            WoWTranslateDB.customAuthHeader = header
+            WoWTranslateDB.customAuthScheme = scheme or ""
+            DEFAULT_CHAT_FRAME:AddMessage("[WoWTranslate] Custom auth header: " .. header .. " " .. (scheme or "") .. " <key>")
+        else
+            DEFAULT_CHAT_FRAME:AddMessage("[WoWTranslate] Current auth: " .. (WoWTranslateDB.customAuthHeader or "Authorization") .. " " .. (WoWTranslateDB.customAuthScheme or "Bearer") .. " <key>")
+            DEFAULT_CHAT_FRAME:AddMessage("  Usage: /wt customauth <HeaderName> [Scheme]  (e.g. /wt customauth Authorization Bearer, or /wt customauth X-API-Key none)")
+        end
+        DEFAULT_CHAT_FRAME:AddMessage("  Re-run /wt provider custom to apply")
+
+    elseif cmd == "customtemplate" then
+        if arg and arg ~= "" then
+            WoWTranslateDB.customRequestTemplate = arg
+            DEFAULT_CHAT_FRAME:AddMessage("[WoWTranslate] Custom request template set")
+        else
+            DEFAULT_CHAT_FRAME:AddMessage("[WoWTranslate] Current template: " .. (WoWTranslateDB.customRequestTemplate ~= "" and WoWTranslateDB.customRequestTemplate or "(default) {\"text\":\"{text}\",\"source\":\"{source}\",\"target\":\"{target}\"}"))
+            DEFAULT_CHAT_FRAME:AddMessage("  Usage: /wt customtemplate {\"text\":\"{text}\",\"source\":\"{source}\",\"target\":\"{target}\"}")
+        end
+        DEFAULT_CHAT_FRAME:AddMessage("  Re-run /wt provider custom to apply")
+
+    elseif cmd == "custompath" then
+        if arg and arg ~= "" then
+            WoWTranslateDB.customResponsePath = arg
+            DEFAULT_CHAT_FRAME:AddMessage("[WoWTranslate] Custom response path set to: " .. arg)
+        else
+            DEFAULT_CHAT_FRAME:AddMessage("[WoWTranslate] Current response path: " .. (WoWTranslateDB.customResponsePath or "translation"))
+            DEFAULT_CHAT_FRAME:AddMessage("  Usage: /wt custompath data.translations[0].translatedText")
+        end
+        DEFAULT_CHAT_FRAME:AddMessage("  Re-run /wt provider custom to apply")
+
     elseif cmd == "show" or cmd == "config" or cmd == "options" then
         if WoWTranslate_ShowConfig then
             WoWTranslate_ShowConfig()
@@ -5941,6 +6053,13 @@ SlashCmdList["WOWTRANSLATE"] = function(msg)
         DEFAULT_CHAT_FRAME:AddMessage("  /wt outgoing on|off - Toggle outgoing translation")
         DEFAULT_CHAT_FRAME:AddMessage("  /wt outchannel [type] - Show/toggle channel settings")
         DEFAULT_CHAT_FRAME:AddMessage("  /wt prefix <text> - Set message prefix")
+        DEFAULT_CHAT_FRAME:AddMessage("  -- Provider --")
+        DEFAULT_CHAT_FRAME:AddMessage("  /wt provider [google_free|custom] - Show/switch translation provider")
+        DEFAULT_CHAT_FRAME:AddMessage("  /wt customendpoint <url> - Set custom HTTPS endpoint")
+        DEFAULT_CHAT_FRAME:AddMessage("  /wt customkey <key> - Set custom endpoint API key")
+        DEFAULT_CHAT_FRAME:AddMessage("  /wt customauth <header> [scheme] - Set custom auth header/scheme")
+        DEFAULT_CHAT_FRAME:AddMessage("  /wt customtemplate <json> - Set custom request body template")
+        DEFAULT_CHAT_FRAME:AddMessage("  /wt custompath <path> - Set response JSON path to the translation")
     end
 end
 
@@ -6096,6 +6215,21 @@ local function OnAddonLoaded()
     end
 
     local dllOk = WoWTranslate_API.CheckDLL()
+
+    -- Re-apply a saved custom provider (the DLL itself only remembers WoWTranslate.ini,
+    -- not in-game /wt commands, so this re-configures it fresh every login).
+    if dllOk and WoWTranslateDB.provider == "custom" and WoWTranslateDB.customEndpoint ~= "" then
+        local ok, err = WoWTranslate_API.ConfigureCustomHttp(
+            WoWTranslateDB.customEndpoint,
+            WoWTranslateDB.customApiKey,
+            WoWTranslateDB.customAuthHeader,
+            WoWTranslateDB.customAuthScheme,
+            WoWTranslateDB.customRequestTemplate,
+            WoWTranslateDB.customResponsePath)
+        if not ok then
+            DEFAULT_CHAT_FRAME:AddMessage("|cFFFF0000[WoWTranslate] Failed to restore custom provider: " .. tostring(err) .. "|r")
+        end
+    end
 
     local glossaryCount = WoWTranslate_GetGlossaryCount()
     local cacheCount = WoWTranslate_CacheStats().entries
