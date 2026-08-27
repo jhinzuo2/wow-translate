@@ -284,6 +284,31 @@ void EnableHttp2(HINTERNET hSession) {
 #endif
 }
 
+// Forces TLS 1.2 only, dropping TLS 1.3 from what WinHTTP offers. This changes the
+// ClientHello WinHTTP/Schannel sends (cipher suite list, extension set — TLS 1.3
+// adds key_share/supported_versions/etc that 1.2-only omits), which changes its
+// JA3/JA4 TLS fingerprint. Diagnostic: if Google's gtx block is keyed off WinHTTP's
+// default (likely TLS 1.3) fingerprint specifically, pinning to 1.2 may dodge it —
+// or may do nothing if the block is IP/header-based after all. Either result is
+// informative. Best-effort: silently no-ops if the flag isn't in this SDK.
+void PinTls12(HINTERNET hSession) {
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2
+    if (!hSession) {
+        return;
+    }
+
+    DWORD secureProtocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+    if (WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS,
+                         &secureProtocols, sizeof(secureProtocols))) {
+        LOG_INFO("Pinned WinHTTP session to TLS 1.2 only (fingerprint test)");
+    } else {
+        LOG_WARNING("Failed to pin TLS 1.2 (WinHttpSetOption error " + to_string(::GetLastError()) + ")");
+    }
+#else
+    (void)hSession;
+#endif
+}
+
 // Fetches the full raw response header block ("Name: value\r\n..." pairs, CRLF-terminated)
 // for diagnostic logging. Uses the growable-buffer WinHTTP pattern since the header
 // block size isn't known up front.
@@ -421,6 +446,7 @@ bool TranslationClient::ConfigureGoogleFree() {
     WinHttpSetTimeouts(hSession, 8000, 8000, 8000, 8000);
 
     LogProxyDiagnostics(hSession);
+    PinTls12(hSession);
     EnableHttp2(hSession);
 
     wstring wHost(host.begin(), host.end());
@@ -485,6 +511,7 @@ bool TranslationClient::ConfigureCustomHttp(const string& endpoint,
     }
 
     WinHttpSetTimeouts(hSession, 5000, 5000, 15000, 30000);
+    PinTls12(hSession);
     EnableHttp2(hSession);
 
     running = true;
