@@ -284,6 +284,87 @@ void EnableHttp2(HINTERNET hSession) {
 #endif
 }
 
+// Fetches the full raw response header block ("Name: value\r\n..." pairs, CRLF-terminated)
+// for diagnostic logging. Uses the growable-buffer WinHTTP pattern since the header
+// block size isn't known up front.
+string QueryRawResponseHeaders(HINTERNET hRequest) {
+    DWORD size = 0;
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                        WINHTTP_HEADER_NAME_BY_INDEX, WINHTTP_NO_OUTPUT_BUFFER,
+                        &size, WINHTTP_NO_HEADER_INDEX);
+    if (size == 0) {
+        return "";
+    }
+
+    vector<wchar_t> buffer(size / sizeof(wchar_t) + 1, L'\0');
+    if (!WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                             WINHTTP_HEADER_NAME_BY_INDEX, buffer.data(),
+                             &size, WINHTTP_NO_HEADER_INDEX)) {
+        return "";
+    }
+
+    wstring wide(buffer.data());
+    return string(wide.begin(), wide.end());
+}
+
+// Truncates and makes a response body single-line-safe for a log entry.
+string PreviewBody(const string& body, size_t maxLen = 400) {
+    string preview = body.substr(0, min(body.length(), maxLen));
+    ReplaceAll(preview, "\r\n", " | ");
+    ReplaceAll(preview, "\n", " | ");
+    if (body.length() > maxLen) {
+        preview += "... (" + to_string(body.length()) + " bytes total)";
+    }
+    return preview;
+}
+
+string WideToNarrow(LPCWSTR wide) {
+    if (!wide) {
+        return "(none)";
+    }
+    wstring w(wide);
+    return string(w.begin(), w.end());
+}
+
+// Logs two independent proxy views so a "works in PowerShell/browser, fails from
+// the game" report can be checked against a proxy/VPN path mismatch:
+//   1. What WinHttpOpen's WINHTTP_ACCESS_TYPE_DEFAULT_PROXY actually resolved to.
+//      This is the *machine-wide* WinHTTP proxy config (netsh winhttp show proxy) —
+//      it is a SEPARATE setting from a browser's proxy/VPN config and is "direct"
+//      on most machines unless something explicitly ran `netsh winhttp set proxy`.
+//   2. The current user's WinINet/IE proxy config — this is what PowerShell's
+//      Invoke-WebRequest and most browsers actually honor. If this differs from
+//      #1 (e.g. a VPN client that only registers itself here), the DLL's traffic
+//      is leaving over a different path/IP than the PowerShell test did.
+void LogProxyDiagnostics(HINTERNET hSession) {
+    WINHTTP_PROXY_INFO proxyInfo = {0};
+    DWORD size = sizeof(proxyInfo);
+    if (WinHttpQueryOption(hSession, WINHTTP_OPTION_PROXY, &proxyInfo, &size)) {
+        LOG_INFO("WinHTTP machine proxy (used by this DLL): access_type=" +
+                 to_string(proxyInfo.dwAccessType) +
+                 ", proxy=" + WideToNarrow(proxyInfo.lpszProxy) +
+                 ", bypass=" + WideToNarrow(proxyInfo.lpszProxyBypass));
+        if (proxyInfo.lpszProxy) GlobalFree(proxyInfo.lpszProxy);
+        if (proxyInfo.lpszProxyBypass) GlobalFree(proxyInfo.lpszProxyBypass);
+    } else {
+        LOG_INFO("WinHTTP machine proxy query failed (likely just \"direct\", no proxy configured)");
+    }
+
+    WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ieConfig = {0};
+    if (WinHttpGetIEProxyConfigForCurrentUser(&ieConfig)) {
+        LOG_INFO("Current-user WinINet/IE proxy (used by PowerShell/browsers): auto_detect=" +
+                 string(ieConfig.fAutoDetect ? "yes" : "no") +
+                 ", auto_config_url=" + WideToNarrow(ieConfig.lpszAutoConfigUrl) +
+                 ", proxy=" + WideToNarrow(ieConfig.lpszProxy) +
+                 ", bypass=" + WideToNarrow(ieConfig.lpszProxyBypass));
+        if (ieConfig.lpszAutoConfigUrl) GlobalFree(ieConfig.lpszAutoConfigUrl);
+        if (ieConfig.lpszProxy) GlobalFree(ieConfig.lpszProxy);
+        if (ieConfig.lpszProxyBypass) GlobalFree(ieConfig.lpszProxyBypass);
+    } else {
+        LOG_INFO("Current-user WinINet/IE proxy query failed");
+    }
+}
+
 } // namespace
 
 // Global variables
@@ -339,6 +420,7 @@ bool TranslationClient::ConfigureGoogleFree() {
     // 8-second timeouts so a blocked/unreachable endpoint fails fast
     WinHttpSetTimeouts(hSession, 8000, 8000, 8000, 8000);
 
+    LogProxyDiagnostics(hSession);
     EnableHttp2(hSession);
 
     wstring wHost(host.begin(), host.end());
@@ -646,16 +728,15 @@ string TranslationClient::HttpsGet(const string& path) {
     }
 #endif
 
+    LOG_DEBUG("Request headers: " + string(headers.begin(), headers.end()));
+
     BOOL result = WinHttpSendRequest(hRequest,
                                      WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                      nullptr, 0, 0, 0);
 
     string response;
     if (result && WinHttpReceiveResponse(hRequest, nullptr)) {
-        // Read HTTP status code before consuming the body.
-        // A 429 response has an unparseable body; surface it explicitly
-        // so the Lua side can trigger immediate backoff rather than treating
-        // it as a generic API parse failure.
+        // Read the HTTP status code before consuming the body.
         DWORD statusCode = 0;
         DWORD statusLen  = sizeof(DWORD);
         WinHttpQueryHeaders(hRequest,
@@ -664,12 +745,11 @@ string TranslationClient::HttpsGet(const string& path) {
             &statusCode, &statusLen,
             WINHTTP_NO_HEADER_INDEX);
         SetLastHttpStatus(statusCode);
-        if (statusCode == 429) {
-            LOG_WARNING("Rate limited by Google (HTTP 429)");
-            WinHttpCloseHandle(hRequest);
-            return "HTTP_429";
-        }
 
+        // Always drain the body, even on non-200, so a 429 (or anything else)
+        // can be logged instead of discarded — Google's block page and an actual
+        // rate-limit response look different in the body even when the status
+        // code is the same, and that's the only way to tell them apart.
         DWORD bytesAvailable = 0;
         char buffer[8192];
         while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable)
@@ -683,8 +763,23 @@ string TranslationClient::HttpsGet(const string& path) {
                 break;
             }
         }
+
+        if (statusCode != 200) {
+            LOG_WARNING("Google response status: " + to_string(statusCode));
+            LOG_WARNING("Google response headers: " + QueryRawResponseHeaders(hRequest));
+            LOG_WARNING("Google response body: " + PreviewBody(response));
+        } else {
+            LOG_DEBUG("Google response status: 200, " + to_string(response.length()) + " bytes");
+        }
+
+        if (statusCode == 429) {
+            LOG_WARNING("Rate limited by Google (HTTP 429)");
+            WinHttpCloseHandle(hRequest);
+            return "HTTP_429";
+        }
     } else {
-        LOG_ERROR("GET request failed: " + to_string(::GetLastError()));
+        DWORD err = ::GetLastError();
+        LOG_ERROR("GET request failed: WinHTTP error " + to_string(err));
     }
 
     WinHttpCloseHandle(hRequest);
