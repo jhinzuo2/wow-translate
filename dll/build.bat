@@ -1,6 +1,8 @@
 @echo off
 REM WoWTranslate DLL Build Script for Windows
-REM Requires: Visual Studio 2022 with C++ workload, CMake 3.20+
+REM Requires: Visual Studio 2022 with C++ workload, CMake 3.20+,
+REM           vcpkg with: vcpkg install curl[openssl]:x86-windows-static
+REM Set VCPKG_ROOT below (or as an env var) before running.
 
 echo ============================================
 echo WoWTranslate DLL Build Script
@@ -31,7 +33,17 @@ echo Configuring CMake for 32-bit build...
 echo.
 
 REM Configure for 32-bit (WoW 1.12 is 32-bit)
-cmake .. -G "Visual Studio 17 2022" -A Win32
+if "%VCPKG_ROOT%"=="" (
+    echo ERROR: VCPKG_ROOT is not set. Install vcpkg, run:
+    echo   vcpkg install curl[openssl]:x86-windows-static
+    echo then set VCPKG_ROOT to your vcpkg checkout path and re-run this script.
+    cd ..
+    exit /b 1
+)
+
+cmake .. -G "Visual Studio 17 2022" -A Win32 ^
+    -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
+    -DVCPKG_TARGET_TRIPLET=x86-windows-static
 
 if %ERRORLEVEL% neq 0 (
     echo ERROR: CMake configuration failed.

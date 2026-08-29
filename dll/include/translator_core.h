@@ -16,7 +16,7 @@
 #include <vector>
 #include <utility>
 
-#include "wininet_bridge.h"
+#include "curl_bridge.h"
 
 // Translation provider mode
 enum class TranslationProvider {

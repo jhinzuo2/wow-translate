@@ -6,6 +6,7 @@
 
 #include "../include/lua_interface.h"
 #include "../include/translator_core.h"
+#include "../include/curl_bridge.h"
 #include "../include/logging.h"
 #include "../include/utils.h"
 
@@ -57,6 +58,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             return FALSE;
         }
 
+        // Note: curl_global_init() is deliberately NOT called here. It happens
+        // lazily on the worker thread's first HTTP request (see curl_bridge.cpp)
+        // to avoid calling LoadLibrary from inside DllMain/loader lock.
+
         LOG_INFO("WoWTranslate initialization complete");
         break;
     }
@@ -71,6 +76,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             g_translator->Cleanup();
             g_translator.reset();
         }
+
+        // curl_global_cleanup() here is fine (cleanup doesn't LoadLibrary), but
+        // if unloading became async/lpReserved != NULL in the future this could
+        // still race a lingering worker-thread request. The worker thread is
+        // joined via g_translator->Cleanup() above before this runs, so there's
+        // no concurrent curl use left by this point.
+        CurlBridgeGlobalCleanup();
 
         CleanupLogging();
         break;

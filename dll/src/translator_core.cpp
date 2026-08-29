@@ -607,13 +607,21 @@ string TranslationClient::HttpsGetGoogleFree(const string& path) {
         {"Accept", "*/*"},
         {"Accept-Language", "en-US,en;q=0.9"}
     };
-    // Note: User-Agent is set inside WinInetHttpsGet itself (via InternetOpenA's
-    // agent parameter) rather than passed here — WinINet uses that as the request's
-    // default User-Agent header.
+    // Note: User-Agent is set inside CurlHttpsGet itself (via CURLOPT_USERAGENT)
+    // rather than passed here.
+    //
+    // Google Free now goes through curl_bridge (libcurl + OpenSSL) instead of
+    // WinINet. Both WinHTTP and WinINet hand TLS to the OS's Schannel, and this
+    // DLL runs 32-bit under WOW64, whose Schannel produces a different TLS
+    // fingerprint than native 64-bit Schannel — that's the likely reason Google's
+    // abuse detection was 429'ing WinINet requests too, despite matching headers.
+    // Statically linking curl against OpenSSL removes Schannel/WOW64 from the
+    // picture entirely. See curl_bridge.h for the full writeup.
 
-    DWORD statusCode = 0;
+    long statusCodeLong = 0;
     string error;
-    string response = WinInetHttpsGet("translate.googleapis.com", 443, path, headers, statusCode, error);
+    string response = CurlHttpsGet("translate.googleapis.com", 443, path, headers, statusCodeLong, error);
+    DWORD statusCode = static_cast<DWORD>(statusCodeLong);
     SetLastHttpStatus(statusCode);
 
     if (statusCode == 0) {
