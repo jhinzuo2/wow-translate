@@ -261,53 +261,13 @@ string ConvertCodepointToUTF8(unsigned int codepoint) {
     return result;
 }
 
-// Opts the session into HTTP/2 where the SDK/OS supports it (WinHTTP defaults to
-// HTTP/1.1 unless asked otherwise). Real browsers use HTTP/2 for this domain, and
-// a plain HTTP/1.1 request is itself one of the signals Google's abuse detection
-// on the free gtx endpoint can key off — this makes the DLL's traffic look closer
-// to what Invoke-WebRequest/a real browser sends. Best-effort: silently no-ops on
-// SDKs/OS builds that don't support the option, since WINHTTP_PROTOCOL_FLAG_HTTP2
-// was only added in the Windows 10 SDK.
-void EnableHttp2(HINTERNET hSession) {
-#ifdef WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL_FLAGS
-    if (!hSession) {
-        return;
-    }
-
-    DWORD protocols = WINHTTP_PROTOCOL_FLAG_HTTP2;
-    if (!WinHttpSetOption(hSession, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL_FLAGS,
-                          &protocols, sizeof(protocols))) {
-        LOG_WARNING("WinHTTP HTTP/2 opt-in not supported by this SDK/OS (falling back to HTTP/1.1)");
-    }
-#else
-    (void)hSession;
-#endif
-}
-
-// Forces TLS 1.2 only, dropping TLS 1.3 from what WinHTTP offers. This changes the
-// ClientHello WinHTTP/Schannel sends (cipher suite list, extension set — TLS 1.3
-// adds key_share/supported_versions/etc that 1.2-only omits), which changes its
-// JA3/JA4 TLS fingerprint. Diagnostic: if Google's gtx block is keyed off WinHTTP's
-// default (likely TLS 1.3) fingerprint specifically, pinning to 1.2 may dodge it —
-// or may do nothing if the block is IP/header-based after all. Either result is
-// informative. Best-effort: silently no-ops if the flag isn't in this SDK.
-void PinTls12(HINTERNET hSession) {
-#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2
-    if (!hSession) {
-        return;
-    }
-
-    DWORD secureProtocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-    if (WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS,
-                         &secureProtocols, sizeof(secureProtocols))) {
-        LOG_INFO("Pinned WinHTTP session to TLS 1.2 only (fingerprint test)");
-    } else {
-        LOG_WARNING("Failed to pin TLS 1.2 (WinHttpSetOption error " + to_string(::GetLastError()) + ")");
-    }
-#else
-    (void)hSession;
-#endif
-}
+// HTTP/2 opt-in and TLS-1.2 pinning were both tried here and removed after a live
+// A/B test: a bare PowerShell Invoke-WebRequest (default TLS negotiation, HTTP/1.1
+// only) succeeded against the exact same endpoint at the exact same time our
+// TLS-1.2-pinned, HTTP/2-enabled WinHTTP session was blocked. Forcing either of
+// those away from the OS/API default made this session's traffic *less* like a
+// normal client, not more — so neither is set here; WinHTTP is left to negotiate
+// its own defaults.
 
 // Fetches the full raw response header block ("Name: value\r\n..." pairs, CRLF-terminated)
 // for diagnostic logging. Uses the growable-buffer WinHTTP pattern since the header
@@ -446,8 +406,12 @@ bool TranslationClient::ConfigureGoogleFree() {
     WinHttpSetTimeouts(hSession, 8000, 8000, 8000, 8000);
 
     LogProxyDiagnostics(hSession);
-    PinTls12(hSession);
-    EnableHttp2(hSession);
+    // Deliberately NOT pinning TLS version or opting into HTTP/2 here: a live A/B
+    // test showed a bare PowerShell Invoke-WebRequest (default TLS negotiation --
+    // TLS 1.3 on modern Windows -- and HTTP/1.1 only, since HttpWebRequest never
+    // speaks HTTP/2) succeeds where our TLS-1.2-pinned, HTTP/2-enabled WinHTTP
+    // session gets blocked. Matching PowerShell means doing LESS here, not more --
+    // let WinHTTP negotiate its own OS default instead of forcing anything.
 
     wstring wHost(host.begin(), host.end());
     hConnect = WinHttpConnect(hSession, wHost.c_str(),
@@ -511,8 +475,12 @@ bool TranslationClient::ConfigureCustomHttp(const string& endpoint,
     }
 
     WinHttpSetTimeouts(hSession, 5000, 5000, 15000, 30000);
-    PinTls12(hSession);
-    EnableHttp2(hSession);
+    // Deliberately NOT pinning TLS version or opting into HTTP/2 here: a live A/B
+    // test showed a bare PowerShell Invoke-WebRequest (default TLS negotiation --
+    // TLS 1.3 on modern Windows -- and HTTP/1.1 only, since HttpWebRequest never
+    // speaks HTTP/2) succeeds where our TLS-1.2-pinned, HTTP/2-enabled WinHTTP
+    // session gets blocked. Matching PowerShell means doing LESS here, not more --
+    // let WinHTTP negotiate its own OS default instead of forcing anything.
 
     running = true;
     workerThread = thread(&TranslationClient::WorkerThreadFunc, this);
