@@ -303,53 +303,6 @@ string PreviewBody(const string& body, size_t maxLen = 400) {
     return preview;
 }
 
-string WideToNarrow(LPCWSTR wide) {
-    if (!wide) {
-        return "(none)";
-    }
-    wstring w(wide);
-    return string(w.begin(), w.end());
-}
-
-// Logs two independent proxy views so a "works in PowerShell/browser, fails from
-// the game" report can be checked against a proxy/VPN path mismatch:
-//   1. What WinHttpOpen's WINHTTP_ACCESS_TYPE_DEFAULT_PROXY actually resolved to.
-//      This is the *machine-wide* WinHTTP proxy config (netsh winhttp show proxy) —
-//      it is a SEPARATE setting from a browser's proxy/VPN config and is "direct"
-//      on most machines unless something explicitly ran `netsh winhttp set proxy`.
-//   2. The current user's WinINet/IE proxy config — this is what PowerShell's
-//      Invoke-WebRequest and most browsers actually honor. If this differs from
-//      #1 (e.g. a VPN client that only registers itself here), the DLL's traffic
-//      is leaving over a different path/IP than the PowerShell test did.
-void LogProxyDiagnostics(HINTERNET hSession) {
-    WINHTTP_PROXY_INFO proxyInfo = {0};
-    DWORD size = sizeof(proxyInfo);
-    if (WinHttpQueryOption(hSession, WINHTTP_OPTION_PROXY, &proxyInfo, &size)) {
-        LOG_INFO("WinHTTP machine proxy (used by this DLL): access_type=" +
-                 to_string(proxyInfo.dwAccessType) +
-                 ", proxy=" + WideToNarrow(proxyInfo.lpszProxy) +
-                 ", bypass=" + WideToNarrow(proxyInfo.lpszProxyBypass));
-        if (proxyInfo.lpszProxy) GlobalFree(proxyInfo.lpszProxy);
-        if (proxyInfo.lpszProxyBypass) GlobalFree(proxyInfo.lpszProxyBypass);
-    } else {
-        LOG_INFO("WinHTTP machine proxy query failed (likely just \"direct\", no proxy configured)");
-    }
-
-    WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ieConfig = {0};
-    if (WinHttpGetIEProxyConfigForCurrentUser(&ieConfig)) {
-        LOG_INFO("Current-user WinINet/IE proxy (used by PowerShell/browsers): auto_detect=" +
-                 string(ieConfig.fAutoDetect ? "yes" : "no") +
-                 ", auto_config_url=" + WideToNarrow(ieConfig.lpszAutoConfigUrl) +
-                 ", proxy=" + WideToNarrow(ieConfig.lpszProxy) +
-                 ", bypass=" + WideToNarrow(ieConfig.lpszProxyBypass));
-        if (ieConfig.lpszAutoConfigUrl) GlobalFree(ieConfig.lpszAutoConfigUrl);
-        if (ieConfig.lpszProxy) GlobalFree(ieConfig.lpszProxy);
-        if (ieConfig.lpszProxyBypass) GlobalFree(ieConfig.lpszProxyBypass);
-    } else {
-        LOG_INFO("Current-user WinINet/IE proxy query failed");
-    }
-}
-
 } // namespace
 
 // Global variables
@@ -359,7 +312,6 @@ char g_error_buffer[256] = {0};
 
 TranslationClient::TranslationClient()
     : hSession(nullptr),
-      hConnect(nullptr),
       initialized(false),
       provider(TranslationProvider::GOOGLE_FREE),
       customAuthHeader("Authorization"),
@@ -386,42 +338,13 @@ bool TranslationClient::ConfigureGoogleFree() {
         lastHttpStatus = 0;
     }
 
-    const std::string host = "translate.googleapis.com";
-    const int port = 443;
-
-    LOG_INFO("Initializing Google Free translation client");
-
-    hSession = WinHttpOpen(L"WoWTranslate/1.0",
-                           WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                           WINHTTP_NO_PROXY_NAME,
-                           WINHTTP_NO_PROXY_BYPASS,
-                           0);
-    if (!hSession) {
-        SetLastError("failed to initialize WinHTTP");
-        LOG_ERROR("Failed to initialize WinHTTP session");
-        return false;
-    }
-
-    // 8-second timeouts so a blocked/unreachable endpoint fails fast
-    WinHttpSetTimeouts(hSession, 8000, 8000, 8000, 8000);
-
-    LogProxyDiagnostics(hSession);
-    // Deliberately NOT pinning TLS version or opting into HTTP/2 here: a live A/B
-    // test showed a bare PowerShell Invoke-WebRequest (default TLS negotiation --
-    // TLS 1.3 on modern Windows -- and HTTP/1.1 only, since HttpWebRequest never
-    // speaks HTTP/2) succeeds where our TLS-1.2-pinned, HTTP/2-enabled WinHTTP
-    // session gets blocked. Matching PowerShell means doing LESS here, not more --
-    // let WinHTTP negotiate its own OS default instead of forcing anything.
-
-    wstring wHost(host.begin(), host.end());
-    hConnect = WinHttpConnect(hSession, wHost.c_str(),
-                              static_cast<INTERNET_PORT>(port), 0);
-    if (!hConnect) {
-        LOG_ERROR("Failed to connect to translate.googleapis.com");
-        WinHttpCloseHandle(hSession);
-        hSession = nullptr;
-        return false;
-    }
+    // Google Free is backed by WinINet (see wininet_bridge.cpp), not WinHTTP — a
+    // live A/B test showed WinHTTP's traffic getting blocked by Google's gtx abuse
+    // detection (even after matching headers and default TLS/HTTP negotiation)
+    // while WinINet-backed traffic (what PowerShell's Invoke-WebRequest actually
+    // uses) was not. WinInetHttpsGet opens its own handles per request, so there's
+    // no persistent session/connection to set up here.
+    LOG_INFO("Initializing Google Free translation client (WinINet)");
 
     running = true;
     workerThread = thread(&TranslationClient::WorkerThreadFunc, this);
@@ -459,8 +382,8 @@ bool TranslationClient::ConfigureCustomHttp(const string& endpoint,
         lastHttpStatus = 0;
     }
 
-    // The custom provider opens a fresh connection per request (HttpsJsonRequest), so all
-    // it needs up front is a plain WinHTTP session — no fixed hConnect like Google Free.
+    // The custom provider opens a fresh WinHttpConnect per request scoped to whatever
+    // host the endpoint points at, so all it needs up front is a plain WinHTTP session.
     LOG_INFO("Initializing custom HTTP translation client: " + MaskUrl(endpoint));
 
     hSession = WinHttpOpen(L"WoWTranslate/1.0",
@@ -559,11 +482,6 @@ void TranslationClient::Cleanup() {
         if (workerThread.joinable()) {
             workerThread.join();
         }
-    }
-
-    if (hConnect) {
-        WinHttpCloseHandle(hConnect);
-        hConnect = nullptr;
     }
 
     if (hSession) {
@@ -684,106 +602,37 @@ string TranslationClient::MapLangCode(const string& lang) {
     return lang;
 }
 
-string TranslationClient::HttpsGet(const string& path) {
-    if (!hConnect) return "";
+string TranslationClient::HttpsGetGoogleFree(const string& path) {
+    vector<pair<string, string>> headers = {
+        {"Accept", "*/*"},
+        {"Accept-Language", "en-US,en;q=0.9"}
+    };
+    // Note: User-Agent is set inside WinInetHttpsGet itself (via InternetOpenA's
+    // agent parameter) rather than passed here — WinINet uses that as the request's
+    // default User-Agent header.
 
-    wstring wPath(path.begin(), path.end());
+    DWORD statusCode = 0;
+    string error;
+    string response = WinInetHttpsGet("translate.googleapis.com", 443, path, headers, statusCode, error);
+    SetLastHttpStatus(statusCode);
 
-    HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect, L"GET", wPath.c_str(), nullptr,
-        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-        WINHTTP_FLAG_SECURE);
-
-    if (!hRequest) {
-        LOG_ERROR("Failed to open GET request");
+    if (statusCode == 0) {
+        // Request never got a response at all (DNS/connect/send failure).
+        SetLastError(error.empty() ? "network error" : error);
         return "";
     }
 
-    // Look like a real browser hitting this endpoint (bare "Mozilla/5.0" with no
-    // Accept-Language/Accept-Encoding is itself a bot signal to Google's abuse
-    // detection on the free gtx endpoint — see the WoWTranslate.log 429 discussion).
-    wstring headers =
-        L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        L"(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36\r\n"
-        L"Accept: */*\r\n"
-        L"Accept-Language: en-US,en;q=0.9\r\n";
-    WinHttpAddRequestHeaders(hRequest, headers.c_str(), (DWORD)-1,
-                             WINHTTP_ADDREQ_FLAG_ADD);
-
-    // Only claim Accept-Encoding: gzip/br if WinHTTP can actually decompress the
-    // response for us (WINHTTP_OPTION_DECOMPRESSION, Win 8.1+ SDK) — otherwise
-    // ParseGoogleFreeResponse's plain-text scan for "[[[" would silently fail
-    // against a compressed body it can't read.
-#ifdef WINHTTP_OPTION_DECOMPRESSION
-    DWORD decompression = WINHTTP_DECOMPRESSION_FLAG_ALL;
-    if (WinHttpSetOption(hRequest, WINHTTP_OPTION_DECOMPRESSION, &decompression, sizeof(decompression))) {
-        wstring acceptEncoding = L"Accept-Encoding: gzip, deflate, br\r\n";
-        WinHttpAddRequestHeaders(hRequest, acceptEncoding.c_str(), (DWORD)-1,
-                                 WINHTTP_ADDREQ_FLAG_ADD);
-    }
-#endif
-
-    LOG_DEBUG("Request headers: " + string(headers.begin(), headers.end()));
-
-    BOOL result = WinHttpSendRequest(hRequest,
-                                     WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                     nullptr, 0, 0, 0);
-
-    string response;
-    if (result && WinHttpReceiveResponse(hRequest, nullptr)) {
-        // Read the HTTP status code before consuming the body.
-        DWORD statusCode = 0;
-        DWORD statusLen  = sizeof(DWORD);
-        WinHttpQueryHeaders(hRequest,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX,
-            &statusCode, &statusLen,
-            WINHTTP_NO_HEADER_INDEX);
-        SetLastHttpStatus(statusCode);
-
-        // Always drain the body, even on non-200, so a 429 (or anything else)
-        // can be logged instead of discarded — Google's block page and an actual
-        // rate-limit response look different in the body even when the status
-        // code is the same, and that's the only way to tell them apart.
-        DWORD bytesAvailable = 0;
-        char buffer[8192];
-        while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable)
-               && bytesAvailable > 0) {
-            DWORD bytesRead = 0;
-            DWORD bytesToRead = min(bytesAvailable, (DWORD)(sizeof(buffer) - 1));
-            if (WinHttpReadData(hRequest, buffer, bytesToRead, &bytesRead)) {
-                buffer[bytesRead] = '\0';
-                response += string(buffer, bytesRead);
-            } else {
-                break;
-            }
-        }
-
-        if (statusCode != 200) {
-            LOG_WARNING("Google response status: " + to_string(statusCode));
-            LOG_WARNING("Google response headers: " + QueryRawResponseHeaders(hRequest));
-            LOG_WARNING("Google response body: " + PreviewBody(response));
-        } else {
-            LOG_DEBUG("Google response status: 200, " + to_string(response.length()) + " bytes");
-        }
-
-        if (statusCode == 429) {
-            LOG_WARNING("Rate limited by Google (HTTP 429)");
-            WinHttpCloseHandle(hRequest);
-            return "HTTP_429";
-        }
-    } else {
-        DWORD err = ::GetLastError();
-        LOG_ERROR("GET request failed: WinHTTP error " + to_string(err));
+    if (statusCode == 429) {
+        LOG_WARNING("Rate limited by Google (HTTP 429)");
+        return "HTTP_429";
     }
 
-    WinHttpCloseHandle(hRequest);
     return response;
 }
 
 // Generic HTTPS JSON request used by the custom provider: opens its own connection
-// scoped to whatever host the configured endpoint points at (unlike HttpsGet, which
-// only ever talks to the persistent Google Free hConnect).
+// scoped to whatever host the configured endpoint points at (unlike the Google Free
+// path, which goes through WinINet instead — see wininet_bridge.cpp).
 string TranslationClient::HttpsJsonRequest(const ParsedUrl& url,
                                            const string& postData,
                                            const vector<pair<string, string>>& headers,
@@ -871,6 +720,15 @@ string TranslationClient::HttpsJsonRequest(const ParsedUrl& url,
             }
 
             response.append(buffer, bytesRead);
+        }
+
+        if (statusCode >= 400) {
+            LOG_WARNING("Custom provider response status: " + to_string(statusCode));
+            LOG_WARNING("Custom provider response headers: " + QueryRawResponseHeaders(hRequest));
+            LOG_WARNING("Custom provider response body: " + PreviewBody(response));
+        } else {
+            LOG_DEBUG("Custom provider response status: " + to_string(statusCode) +
+                     ", " + to_string(response.length()) + " bytes");
         }
     } else {
         DWORD err = ::GetLastError();
@@ -1003,7 +861,7 @@ TranslationResult TranslationClient::TranslateWithGoogleFree(const string& text,
 
     LOG_DEBUG("GET " + path.substr(0, 120));
 
-    string response = HttpsGet(path);
+    string response = HttpsGetGoogleFree(path);
 
     if (response == "HTTP_429") {
         return TranslationResult::RATE_LIMITED;

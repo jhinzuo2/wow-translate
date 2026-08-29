@@ -16,6 +16,8 @@
 #include <vector>
 #include <utility>
 
+#include "wininet_bridge.h"
+
 // Translation provider mode
 enum class TranslationProvider {
     GOOGLE_FREE = 0,   // translate.googleapis.com gtx endpoint, no key needed (default)
@@ -70,8 +72,7 @@ struct CacheEntry {
 
 class TranslationClient {
 private:
-    HINTERNET hSession;
-    HINTERNET hConnect;  // persistent connection, used only by the GOOGLE_FREE provider
+    HINTERNET hSession;  // used only by the CUSTOM_HTTP provider (Google Free is WinINet-backed — see wininet_bridge.cpp)
     std::unordered_map<std::string, CacheEntry> cache;
     bool initialized;
 
@@ -110,7 +111,7 @@ private:
     };
 
     std::string UrlEncode(const std::string& text);
-    std::string HttpsGet(const std::string& path);   // fixed-host GET against the persistent hConnect (GOOGLE_FREE)
+    std::string HttpsGetGoogleFree(const std::string& path);  // WinINet-backed GET to translate.googleapis.com
     std::string MapLangCode(const std::string& lang);
     std::string ParseGoogleFreeResponse(const std::string& json);
     std::string GenerateCacheKey(const std::string& text,

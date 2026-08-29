@@ -14,6 +14,7 @@ add_library(WoWTranslate SHARED
     src/dllmain.cpp
     src/lua_interface.cpp
     src/translator_core.cpp
+    src/wininet_bridge.cpp
     src/logging.cpp
     src/utils.cpp
     src/WoWTranslate.def
@@ -28,12 +29,13 @@ target_include_directories(WoWTranslate PRIVATE
 # MinHook library setup - Force 32-bit for WoW compatibility
 set(MINHOOK_LIB "${CMAKE_CURRENT_SOURCE_DIR}/third_party/MinHook.x86.lib")
 
-# Link libraries - adding winhttp for translation functionality
+# Link libraries - winhttp (custom-endpoint provider) and wininet (Google Free provider)
 target_link_libraries(WoWTranslate PRIVATE
     kernel32
     user32
     shell32
     winhttp
+    wininet
 )
 
 # Add MinHook if available
