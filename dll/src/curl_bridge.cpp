@@ -9,6 +9,7 @@
 
 #include "../include/curl_bridge.h"
 #include "../include/logging.h"
+#include "../include/utils.h"
 
 using namespace std;
 
@@ -57,6 +58,25 @@ int DebugCallback(CURL*, curl_infotype type, char* data, size_t size, void* user
 once_flag g_globalInitFlag;
 bool g_globalInitOk = false;
 
+// Cached path to cacert.pem, resolved once next to the DLL. A statically-linked
+// OpenSSL build (unlike Schannel/WinINet/WinHTTP) has no access to the Windows
+// certificate store, so without an explicit CA bundle every single HTTPS request
+// fails cert verification with "unable to get local issuer certificate" - this
+// isn't optional. Download from https://curl.se/ca/cacert.pem and place it next
+// to WoWTranslate.dll (same directory as WoWTranslate.ini).
+string g_caBundlePath;
+
+string ResolveCaBundlePath() {
+    string dllPath = GetDllPath();
+    if (dllPath.empty()) {
+        LOG_WARNING("curl: could not resolve DLL path to locate cacert.pem");
+        return "";
+    }
+    size_t slash = dllPath.find_last_of("\\/");
+    string dllDir = (slash == string::npos) ? "" : dllPath.substr(0, slash + 1);
+    return dllDir + "cacert.pem";
+}
+
 } // namespace
 
 namespace {
@@ -84,6 +104,19 @@ void DoGlobalInitOnce() {
         LOG_INFO(string("curl SSL backend: ") + info->ssl_version);
     } else {
         LOG_WARNING("curl: could not determine linked SSL backend");
+    }
+
+    g_caBundlePath = ResolveCaBundlePath();
+    DWORD attrs = g_caBundlePath.empty() ? INVALID_FILE_ATTRIBUTES
+                                          : GetFileAttributesA(g_caBundlePath.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        LOG_ERROR("curl: cacert.pem not found at " + g_caBundlePath +
+                   " - every HTTPS request will fail cert verification. "
+                   "Download from https://curl.se/ca/cacert.pem and place it "
+                   "next to WoWTranslate.dll.");
+        g_caBundlePath.clear();  // don't hand curl a path we know is bad
+    } else {
+        LOG_INFO("curl: using CA bundle at " + g_caBundlePath);
     }
 
     g_globalInitOk = true;
@@ -168,6 +201,13 @@ string CurlHttpsGet(const string& host, int port, const string& pathAndQuery,
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);    // match prior behavior, no redirects
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    if (!g_caBundlePath.empty()) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, g_caBundlePath.c_str());
+    }
+    // If g_caBundlePath is empty (missing file, already logged loudly at init),
+    // this deliberately does NOT fall back to CURLOPT_SSL_VERIFYPEER=0 - skipping
+    // cert verification would silently reopen this to MITM. Better to fail loud
+    // and consistently until the bundle is actually present.
 
     curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, DebugCallback);
     curl_easy_setopt(curl, CURLOPT_DEBUGDATA, &debugCapture);

@@ -57,6 +57,7 @@ Extract and copy to your WoW folder:
 YourWoWFolder/
 ├── WoW.exe
 ├── WoWTranslate.dll        ← From the download
+├── cacert.pem              ← From the download (required, see note below)
 ├── dlls.txt                ← Add "WoWTranslate.dll" to this file
 └── Interface/
     └── AddOns/
@@ -64,6 +65,8 @@ YourWoWFolder/
 ```
 
 > **Note:** If `dlls.txt` doesn't exist, create it and add `WoWTranslate.dll` on the first line.
+
+> **Note:** `cacert.pem` must sit in the same folder as `WoWTranslate.dll` (next to `WoW.exe`). It's a CA certificate bundle the translation client needs to verify Google's HTTPS certificate. Without it, translations will fail with a certificate error in the debug log. If it's missing, download it from https://curl.se/ca/cacert.pem.
 
 > You have to run via `VanillaFixes.exe` or any other WoW dll launcher.
 

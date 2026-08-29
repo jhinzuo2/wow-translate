@@ -76,6 +76,16 @@ jobs:
       working-directory: dll/build
       run: cmake --build . --config Release
 
+    # cacert.pem is required next to the DLL: the statically-linked OpenSSL
+    # backend (used to avoid the WOW64/Schannel TLS fingerprint issue - see
+    # dll/include/curl_bridge.h) has no access to the Windows certificate
+    # store, so it needs its own CA bundle or every HTTPS request fails cert
+    # verification. Fetched fresh each build so it stays current; this is the
+    # same file curl.se maintains for exactly this purpose (extracted from
+    # Mozilla's CA list).
+    - name: Fetch CA bundle for curl
+      run: Invoke-WebRequest -Uri "https://curl.se/ca/cacert.pem" -OutFile "dll/build/bin/Release/cacert.pem"
+
     - name: List build output
       working-directory: dll/build
       run: |
@@ -86,7 +96,9 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: WoWTranslate-DLL
-        path: dll/build/bin/Release/WoWTranslate.dll
+        path: |
+          dll/build/bin/Release/WoWTranslate.dll
+          dll/build/bin/Release/cacert.pem
         if-no-files-found: error
 
     - name: Upload full addon package
@@ -95,6 +107,7 @@ jobs:
         name: WoWTranslate-Full
         path: |
           dll/build/bin/Release/WoWTranslate.dll
+          dll/build/bin/Release/cacert.pem
           Interface/AddOns/WoWTranslate/
         if-no-files-found: error
 
@@ -122,7 +135,7 @@ jobs:
     - name: Create release zip
       working-directory: release
       run: |
-        zip -r WoWTranslate-v0.1.zip WoWTranslate.dll WoWTranslate/
+        zip -r WoWTranslate-v0.1.zip WoWTranslate.dll cacert.pem WoWTranslate/
 
     - name: Upload release zip
       uses: actions/upload-artifact@v4

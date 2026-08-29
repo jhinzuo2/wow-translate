@@ -68,10 +68,26 @@ echo ============================================
 echo Build successful!
 echo ============================================
 echo.
+
+REM cacert.pem is required next to the DLL: the statically-linked OpenSSL
+REM backend (used to avoid the WOW64/Schannel TLS fingerprint issue - see
+REM dll/include/curl_bridge.h) has no access to the Windows certificate store,
+REM so it needs its own CA bundle file to verify Google's cert or every HTTPS
+REM request fails with "unable to get local issuer certificate".
+echo Fetching cacert.pem (CA bundle for curl's OpenSSL backend)...
+curl.exe -fsSL -o bin\Release\cacert.pem https://curl.se/ca/cacert.pem
+if %ERRORLEVEL% neq 0 (
+    echo WARNING: Failed to download cacert.pem automatically.
+    echo Download it manually from https://curl.se/ca/cacert.pem and place it
+    echo in build\bin\Release\ next to WoWTranslate.dll before installing.
+)
+
+echo.
 echo Output: build\bin\Release\WoWTranslate.dll
+echo         build\bin\Release\cacert.pem
 echo.
 echo Installation:
-echo 1. Copy WoWTranslate.dll to your WoW folder (next to WoW.exe)
+echo 1. Copy WoWTranslate.dll AND cacert.pem to your WoW folder (next to WoW.exe)
 echo 2. Add "WoWTranslate.dll" to dlls.txt
 echo 3. Copy WoWTranslate addon folder to Interface\AddOns\
 echo.
