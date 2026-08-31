@@ -135,6 +135,9 @@ private:
     // are tried in order before giving up. None of these have an SLA either - this
     // only helps when they aren't ALL down/blocked at the same time.
     //   - gtx:            translate.googleapis.com/translate_a/single (Google Translate website)
+    //   - tw-ob:          translate.googleapis.com/translate_a/single, same endpoint/response
+    //                      shape as gtx, just a different client id (Google's "Translate Web"
+    //                      mobile client) - a distinct rate-limit bucket from gtx for free
     //   - dict-chrome-ex: clients5.google.com/translate_a/t (Google Dictionary Chrome extension)
     //   - edge-translate: api.cognitive.microsofttranslator.com via edge.microsoft.com's
     //                      anonymous auth token (Microsoft Edge's built-in translate feature)
@@ -142,6 +145,14 @@ private:
                                               const std::string& sourceLang, const std::string& targetLang);
     TranslationResult TranslateWithGtx(const std::string& text, std::string& result,
                                        const std::string& sourceLang, const std::string& targetLang);
+    TranslationResult TranslateWithTwOb(const std::string& text, std::string& result,
+                                        const std::string& sourceLang, const std::string& targetLang);
+    // Shared by TranslateWithGtx and TranslateWithTwOb: both hit
+    // translate.googleapis.com/translate_a/single with the same params, differing
+    // only in the "client" query value, and parse the same [[[...]]] response shape.
+    TranslationResult TranslateWithGoogleSingleClient(const std::string& clientId,
+                                                       const std::string& text, std::string& result,
+                                                       const std::string& sourceLang, const std::string& targetLang);
     TranslationResult TranslateWithDictChromeEx(const std::string& text, std::string& result,
                                                 const std::string& sourceLang, const std::string& targetLang);
     TranslationResult TranslateWithEdgeTranslate(const std::string& text, std::string& result,

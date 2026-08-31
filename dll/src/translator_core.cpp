@@ -861,9 +861,9 @@ string TranslationClient::ParseGoogleFreeResponse(const string& json) {
 }
 
 // The GOOGLE_FREE provider is a fallback chain: gtx is tried first (this is the
-// original, unchanged behavior), then dict-chrome-ex, then edge-translate, in
-// that order. All three are free/keyless — see translator_core.h for what each
-// one actually is.
+// original, unchanged behavior), then tw-ob, then dict-chrome-ex, then
+// edge-translate, in that order. All four are free/keyless — see
+// translator_core.h for what each one actually is.
 TranslationResult TranslationClient::TranslateWithGoogleFree(const string& text, string& result,
                                                               const string& sourceLang, const string& targetLang) {
     struct FreeBackend {
@@ -872,6 +872,7 @@ TranslationResult TranslationClient::TranslateWithGoogleFree(const string& text,
     };
     static const FreeBackend backends[] = {
         {"gtx",            &TranslationClient::TranslateWithGtx},
+        {"tw-ob",          &TranslationClient::TranslateWithTwOb},
         {"dict-chrome-ex", &TranslationClient::TranslateWithDictChromeEx},
         {"edge-translate", &TranslationClient::TranslateWithEdgeTranslate},
     };
@@ -903,10 +904,27 @@ TranslationResult TranslationClient::TranslateWithGoogleFree(const string& text,
 
 TranslationResult TranslationClient::TranslateWithGtx(const string& text, string& result,
                                                        const string& sourceLang, const string& targetLang) {
+    return TranslateWithGoogleSingleClient("gtx", text, result, sourceLang, targetLang);
+}
+
+// translate.googleapis.com/translate_a/single with client=tw-ob instead of client=gtx.
+// tw-ob is the client id Google's own "Translate Web" mobile client uses when it calls
+// this same endpoint - same params, same [[[...]]] response shape as gtx, verified
+// against a live Invoke-RestMethod call. Falling back to it after gtx gives a second,
+// independently-rate-limited path through the same endpoint before moving on to the
+// dict-chrome-ex/edge-translate backends, which live on different hosts entirely.
+TranslationResult TranslationClient::TranslateWithTwOb(const string& text, string& result,
+                                                        const string& sourceLang, const string& targetLang) {
+    return TranslateWithGoogleSingleClient("tw-ob", text, result, sourceLang, targetLang);
+}
+
+TranslationResult TranslationClient::TranslateWithGoogleSingleClient(const string& clientId,
+                                                                      const string& text, string& result,
+                                                                      const string& sourceLang, const string& targetLang) {
     // Build Google Free GET path
     string sl = MapLangCode(sourceLang);
     string tl = MapLangCode(targetLang);
-    string path = "/translate_a/single?client=gtx&sl=" + sl +
+    string path = "/translate_a/single?client=" + clientId + "&sl=" + sl +
                   "&tl=" + tl + "&dt=t&q=" + UrlEncode(text);
 
     LOG_DEBUG("GET " + path.substr(0, 120));
@@ -918,7 +936,7 @@ TranslationResult TranslationClient::TranslateWithGtx(const string& text, string
     }
 
     if (response.empty()) {
-        LOG_ERROR("Empty response from Google Free");
+        LOG_ERROR("Empty response from Google Free (client=" + clientId + ")");
         result = "network error";
         SetLastError(result);
         return TranslationResult::NETWORK_ERROR;
@@ -929,7 +947,7 @@ TranslationResult TranslationClient::TranslateWithGtx(const string& text, string
     string translation = ParseGoogleFreeResponse(response);
 
     if (translation.empty()) {
-        LOG_ERROR("Failed to parse Google Free response");
+        LOG_ERROR("Failed to parse Google Free response (client=" + clientId + ")");
         result = "failed to parse Google Free response";
         SetLastError(result);
         return TranslationResult::API_ERROR;
