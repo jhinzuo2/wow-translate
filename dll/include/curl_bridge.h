@@ -48,3 +48,14 @@ std::string CurlHttpsGet(const std::string& host,
                           const std::vector<std::pair<std::string, std::string>>& headers,
                           long& statusCode,
                           std::string& outError);
+
+// Same contract as CurlHttpsGet, but issues a POST with the given body (e.g. a
+// JSON payload). Content-Type is NOT set automatically — include it in headers
+// if the target expects one (most JSON APIs do).
+std::string CurlHttpsPost(const std::string& host,
+                           int port,
+                           const std::string& pathAndQuery,
+                           const std::string& body,
+                           const std::vector<std::pair<std::string, std::string>>& headers,
+                           long& statusCode,
+                           std::string& outError);

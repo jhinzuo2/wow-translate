@@ -139,9 +139,14 @@ void CurlBridgeGlobalCleanup() {
     }
 }
 
-string CurlHttpsGet(const string& host, int port, const string& pathAndQuery,
-                     const vector<pair<string, string>>& headers,
-                     long& statusCode, string& outError) {
+// Shared setup for both CurlHttpsGet and CurlHttpsPost — everything except the
+// HTTP method and (for POST) the body. postBody is nullptr for a GET.
+namespace {
+
+string PerformCurlRequest(const string& method, const string& host, int port,
+                          const string& pathAndQuery, const string* postBody,
+                          const vector<pair<string, string>>& headers,
+                          long& statusCode, string& outError) {
     statusCode = 0;
     outError.clear();
 
@@ -173,7 +178,13 @@ string CurlHttpsGet(const string& host, int port, const string& pathAndQuery,
     }
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    if (postBody) {
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postBody->c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(postBody->length()));
+    } else {
+        curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    }
     if (headerList) {
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
     }
@@ -213,12 +224,18 @@ string CurlHttpsGet(const string& host, int port, const string& pathAndQuery,
     curl_easy_setopt(curl, CURLOPT_DEBUGDATA, &debugCapture);
     curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
 
-    LOG_DEBUG("curl GET " + url);
+    LOG_DEBUG("curl " + method + " " + url);
     if (headerList) {
         string headerBlock;
         for (const auto& header : headers) {
             if (!header.first.empty() && !header.second.empty()) {
-                headerBlock += header.first + ": " + header.second + "\r\n";
+                // Don't log the Authorization value itself (bearer tokens) - just
+                // confirm the header name was set.
+                if (header.first == "Authorization") {
+                    headerBlock += header.first + ": <redacted>\r\n";
+                } else {
+                    headerBlock += header.first + ": " + header.second + "\r\n";
+                }
             }
         }
         LOG_DEBUG("curl request headers: " + headerBlock);
@@ -252,4 +269,19 @@ string CurlHttpsGet(const string& host, int port, const string& pathAndQuery,
     curl_easy_cleanup(curl);
 
     return responseBody;
+}
+
+} // namespace
+
+string CurlHttpsGet(const string& host, int port, const string& pathAndQuery,
+                     const vector<pair<string, string>>& headers,
+                     long& statusCode, string& outError) {
+    return PerformCurlRequest("GET", host, port, pathAndQuery, nullptr, headers, statusCode, outError);
+}
+
+string CurlHttpsPost(const string& host, int port, const string& pathAndQuery,
+                      const string& body,
+                      const vector<pair<string, string>>& headers,
+                      long& statusCode, string& outError) {
+    return PerformCurlRequest("POST", host, port, pathAndQuery, &body, headers, statusCode, outError);
 }

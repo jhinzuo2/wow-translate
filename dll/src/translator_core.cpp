@@ -318,7 +318,8 @@ TranslationClient::TranslationClient()
       customAuthScheme("Bearer"),
       customResponsePath("translation"),
       lastHttpStatus(0),
-      running(false) {
+      running(false),
+      edgeTokenExpiresTick(0) {
 }
 
 TranslationClient::~TranslationClient() {
@@ -859,8 +860,49 @@ string TranslationClient::ParseGoogleFreeResponse(const string& json) {
     return result;
 }
 
+// The GOOGLE_FREE provider is a fallback chain: gtx is tried first (this is the
+// original, unchanged behavior), then dict-chrome-ex, then edge-translate, in
+// that order. All three are free/keyless — see translator_core.h for what each
+// one actually is.
 TranslationResult TranslationClient::TranslateWithGoogleFree(const string& text, string& result,
                                                               const string& sourceLang, const string& targetLang) {
+    struct FreeBackend {
+        const char* name;
+        TranslationResult (TranslationClient::*fn)(const string&, string&, const string&, const string&);
+    };
+    static const FreeBackend backends[] = {
+        {"gtx",            &TranslationClient::TranslateWithGtx},
+        {"dict-chrome-ex", &TranslationClient::TranslateWithDictChromeEx},
+        {"edge-translate", &TranslationClient::TranslateWithEdgeTranslate},
+    };
+    static const size_t backendCount = sizeof(backends) / sizeof(backends[0]);
+
+    TranslationResult lastResult = TranslationResult::NETWORK_ERROR;
+
+    for (size_t i = 0; i < backendCount; ++i) {
+        result.clear();
+        lastResult = (this->*backends[i].fn)(text, result, sourceLang, targetLang);
+
+        if (lastResult == TranslationResult::SUCCESS) {
+            if (i > 0) {
+                LOG_INFO(string("Free-tier fallback: ") + backends[i].name +
+                         " succeeded after " + to_string(i) + " earlier backend(s) failed");
+            }
+            return TranslationResult::SUCCESS;
+        }
+
+        bool haveMoreBackends = (i + 1 < backendCount);
+        LOG_WARNING(string(backends[i].name) + " failed (" +
+                    (lastResult == TranslationResult::RATE_LIMITED ? "rate limited" : "error") +
+                    (result.empty() ? "" : ": " + result) + ")" +
+                    (haveMoreBackends ? " - trying next free backend" : " - all free backends exhausted"));
+    }
+
+    return lastResult;
+}
+
+TranslationResult TranslationClient::TranslateWithGtx(const string& text, string& result,
+                                                       const string& sourceLang, const string& targetLang) {
     // Build Google Free GET path
     string sl = MapLangCode(sourceLang);
     string tl = MapLangCode(targetLang);
@@ -897,6 +939,196 @@ TranslationResult TranslationClient::TranslateWithGoogleFree(const string& text,
     SetLastError("");
     LOG_DEBUG("Translated: " + text.substr(0, 30) + " -> " + translation.substr(0, 50));
     return TranslationResult::SUCCESS;
+}
+
+// clients5.google.com/translate_a/t?client=dict-chrome-ex - the endpoint the
+// official Google Dictionary Chrome extension uses. Deliberately omitting dt=t:
+// without it the response is a plain 2-element array, ["translated text",
+// "detected_source_lang"], instead of the more complex {"sentences":[...],
+// "dict":[...]} object shape dt=t triggers on this endpoint - much less to parse
+// and less to break if the shape drifts.
+TranslationResult TranslationClient::TranslateWithDictChromeEx(const string& text, string& result,
+                                                                const string& sourceLang, const string& targetLang) {
+    string sl = MapLangCode(sourceLang);
+    string tl = MapLangCode(targetLang);
+    string path = "/translate_a/t?client=dict-chrome-ex&sl=" + sl + "&tl=" + tl + "&q=" + UrlEncode(text);
+
+    vector<pair<string, string>> headers = {
+        {"Accept", "*/*"},
+        {"Accept-Language", "en-US,en;q=0.9"}
+    };
+
+    long statusCodeLong = 0;
+    string error;
+    string response = CurlHttpsGet("clients5.google.com", 443, path, headers, statusCodeLong, error);
+    DWORD statusCode = static_cast<DWORD>(statusCodeLong);
+    SetLastHttpStatus(statusCode);
+
+    if (statusCode == 0) {
+        result = error.empty() ? "network error" : error;
+        SetLastError(result);
+        return TranslationResult::NETWORK_ERROR;
+    }
+    if (statusCode == 429) {
+        return TranslationResult::RATE_LIMITED;
+    }
+    if (statusCode == 403) {
+        // Documented failure mode when the client param is missing/wrong.
+        result = "dict-chrome-ex returned 403";
+        SetLastError(result);
+        return TranslationResult::API_ERROR;
+    }
+
+    try {
+        json parsed = json::parse(response);
+        if (parsed.is_array() && !parsed.empty() && parsed[0].is_string()) {
+            result = TrimCopy(parsed[0].get<string>());
+            if (result.empty()) {
+                result = "empty translation from dict-chrome-ex";
+                SetLastError(result);
+                return TranslationResult::API_ERROR;
+            }
+            SetLastError("");
+            return TranslationResult::SUCCESS;
+        }
+
+        result = "unexpected dict-chrome-ex response shape";
+        SetLastError(result);
+        return TranslationResult::API_ERROR;
+    } catch (const exception& e) {
+        result = string("failed to parse dict-chrome-ex response: ") + e.what();
+        SetLastError(result);
+        return TranslationResult::API_ERROR;
+    }
+}
+
+string TranslationClient::MapLangCodeMicrosoft(const string& lang) {
+    if (lang == "zh") return "zh-Hans";
+    // en, ja, ko, ru are already valid Microsoft Translator language codes
+    return lang;
+}
+
+// GET https://edge.microsoft.com/translate/auth returns a bearer token as plain
+// text (not JSON-wrapped) - this is the same anonymous, keyless auth flow
+// Microsoft Edge's built-in translate feature itself uses. Cached conservatively
+// for 8 minutes (the documented Azure token lifetime for this flow is ~10
+// minutes); a 401 on the actual translate call also drops the cache below so the
+// next attempt fetches fresh rather than retrying the same stale token forever.
+bool TranslationClient::GetEdgeAuthToken(string& outToken, string& outError) {
+    {
+        lock_guard<mutex> lock(edgeTokenMutex);
+        if (!cachedEdgeToken.empty() && GetTickCount() < edgeTokenExpiresTick) {
+            outToken = cachedEdgeToken;
+            return true;
+        }
+    }
+
+    vector<pair<string, string>> headers;  // no special headers needed for the auth call
+    long statusCodeLong = 0;
+    string response = CurlHttpsGet("edge.microsoft.com", 443, "/translate/auth", headers, statusCodeLong, outError);
+    DWORD statusCode = static_cast<DWORD>(statusCodeLong);
+
+    if (statusCode != 200 || response.empty()) {
+        if (outError.empty()) {
+            outError = "edge auth failed, HTTP " + to_string(statusCode);
+        }
+        return false;
+    }
+
+    string token = TrimCopy(response);
+    if (token.empty()) {
+        outError = "edge auth returned an empty token";
+        return false;
+    }
+
+    {
+        lock_guard<mutex> lock(edgeTokenMutex);
+        cachedEdgeToken = token;
+        edgeTokenExpiresTick = GetTickCount() + 8 * 60 * 1000;
+    }
+
+    outToken = token;
+    return true;
+}
+
+// api.cognitive.microsofttranslator.com/translate?api-version=3.0 - the standard
+// Microsoft Translator v3 REST API, authenticated with the anonymous token from
+// GetEdgeAuthToken instead of a real Azure subscription key. This is the same
+// flow Microsoft Edge's built-in page-translate feature uses.
+TranslationResult TranslationClient::TranslateWithEdgeTranslate(const string& text, string& result,
+                                                                 const string& sourceLang, const string& targetLang) {
+    string token;
+    string tokenError;
+    if (!GetEdgeAuthToken(token, tokenError)) {
+        result = "edge auth failed: " + tokenError;
+        SetLastError(result);
+        return TranslationResult::NETWORK_ERROR;
+    }
+
+    string sl = MapLangCodeMicrosoft(sourceLang);
+    string tl = MapLangCodeMicrosoft(targetLang);
+    string path = "/translate?from=" + sl + "&to=" + tl + "&api-version=3.0";
+
+    json bodyArray = json::array();
+    json textObj = json::object();
+    textObj["Text"] = text;
+    bodyArray.push_back(textObj);
+    string body = bodyArray.dump(-1, ' ', false, json::error_handler_t::replace);
+
+    vector<pair<string, string>> headers = {
+        {"Authorization", "Bearer " + token},
+        {"Content-Type", "application/json"}
+    };
+
+    long statusCodeLong = 0;
+    string error;
+    string response = CurlHttpsPost("api.cognitive.microsofttranslator.com", 443, path, body, headers, statusCodeLong, error);
+    DWORD statusCode = static_cast<DWORD>(statusCodeLong);
+    SetLastHttpStatus(statusCode);
+
+    if (statusCode == 0) {
+        result = error.empty() ? "network error" : error;
+        SetLastError(result);
+        return TranslationResult::NETWORK_ERROR;
+    }
+    if (statusCode == 401) {
+        // Cached token was rejected - drop it so the NEXT attempt (next chain
+        // call, or a later retry) fetches a fresh one instead of repeating this.
+        lock_guard<mutex> lock(edgeTokenMutex);
+        cachedEdgeToken.clear();
+        result = "edge translate auth token rejected (401)";
+        SetLastError(result);
+        return TranslationResult::API_ERROR;
+    }
+    if (statusCode == 429) {
+        return TranslationResult::RATE_LIMITED;
+    }
+
+    try {
+        json parsed = json::parse(response);
+        // Expected shape: [{"translations":[{"text":"...","to":"en"}]}]
+        if (parsed.is_array() && !parsed.empty() &&
+            parsed[0].contains("translations") && parsed[0]["translations"].is_array() &&
+            !parsed[0]["translations"].empty() &&
+            parsed[0]["translations"][0].contains("text")) {
+            result = TrimCopy(parsed[0]["translations"][0]["text"].get<string>());
+            if (result.empty()) {
+                result = "empty translation from edge translate";
+                SetLastError(result);
+                return TranslationResult::API_ERROR;
+            }
+            SetLastError("");
+            return TranslationResult::SUCCESS;
+        }
+
+        result = "unexpected edge translate response shape";
+        SetLastError(result);
+        return TranslationResult::API_ERROR;
+    } catch (const exception& e) {
+        result = string("failed to parse edge translate response: ") + e.what();
+        SetLastError(result);
+        return TranslationResult::API_ERROR;
+    }
 }
 
 TranslationResult TranslationClient::TranslateWithCustom(const string& text, string& result,

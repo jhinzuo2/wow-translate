@@ -72,7 +72,7 @@ struct CacheEntry {
 
 class TranslationClient {
 private:
-    HINTERNET hSession;  // used only by the CUSTOM_HTTP provider (Google Free is WinINet-backed — see wininet_bridge.cpp)
+    HINTERNET hSession;  // used only by the CUSTOM_HTTP provider (Google Free's fallback chain is curl-backed — see curl_bridge.cpp)
     std::unordered_map<std::string, CacheEntry> cache;
     bool initialized;
 
@@ -111,8 +111,9 @@ private:
     };
 
     std::string UrlEncode(const std::string& text);
-    std::string HttpsGetGoogleFree(const std::string& path);  // WinINet-backed GET to translate.googleapis.com
-    std::string MapLangCode(const std::string& lang);
+    std::string HttpsGetGoogleFree(const std::string& path);  // curl-backed GET to translate.googleapis.com (gtx)
+    std::string MapLangCode(const std::string& lang);              // Google-style codes (zh -> zh-CN), used by gtx and dict-chrome-ex
+    std::string MapLangCodeMicrosoft(const std::string& lang);      // Microsoft-style codes (zh -> zh-Hans), used by Edge Translate
     std::string ParseGoogleFreeResponse(const std::string& json);
     std::string GenerateCacheKey(const std::string& text,
                                  const std::string& sourceLang,
@@ -127,8 +128,30 @@ private:
                                  const std::vector<std::pair<std::string, std::string>>& headers,
                                  DWORD& statusCode,
                                  bool useGet = false);
+
+    // GOOGLE_FREE is actually a fallback CHAIN of unofficial, keyless endpoints
+    // reverse-engineered from real Google/Microsoft clients: gtx is tried first
+    // (unchanged, original behavior); on failure (429/network/parse error) these
+    // are tried in order before giving up. None of these have an SLA either - this
+    // only helps when they aren't ALL down/blocked at the same time.
+    //   - gtx:            translate.googleapis.com/translate_a/single (Google Translate website)
+    //   - dict-chrome-ex: clients5.google.com/translate_a/t (Google Dictionary Chrome extension)
+    //   - edge-translate: api.cognitive.microsofttranslator.com via edge.microsoft.com's
+    //                      anonymous auth token (Microsoft Edge's built-in translate feature)
     TranslationResult TranslateWithGoogleFree(const std::string& text, std::string& result,
                                               const std::string& sourceLang, const std::string& targetLang);
+    TranslationResult TranslateWithGtx(const std::string& text, std::string& result,
+                                       const std::string& sourceLang, const std::string& targetLang);
+    TranslationResult TranslateWithDictChromeEx(const std::string& text, std::string& result,
+                                                const std::string& sourceLang, const std::string& targetLang);
+    TranslationResult TranslateWithEdgeTranslate(const std::string& text, std::string& result,
+                                                 const std::string& sourceLang, const std::string& targetLang);
+    bool GetEdgeAuthToken(std::string& outToken, std::string& outError);
+
+    std::mutex edgeTokenMutex;
+    std::string cachedEdgeToken;
+    DWORD edgeTokenExpiresTick;  // GetTickCount() value after which the cached token is treated as stale
+
     TranslationResult TranslateWithCustom(const std::string& text, std::string& result,
                                           const std::string& sourceLang, const std::string& targetLang);
     void SetLastError(const std::string& error);
