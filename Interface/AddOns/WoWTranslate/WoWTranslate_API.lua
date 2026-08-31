@@ -580,6 +580,7 @@ function WoWTranslate_API.GetProviderStatus()
         ready = false,
         endpoint = "",
         lastHttpStatus = 0,
+        freeBackend = "auto",
     }
 
     if not dllAvailable or not UnitXP then
@@ -596,19 +597,23 @@ function WoWTranslate_API.GetProviderStatus()
         status.ready = JsonGetBool(result, "ready")
         status.endpoint = JsonGetString(result, "endpoint") or ""
         status.lastHttpStatus = JsonGetNumber(result, "lastHttpStatus") or 0
+        status.freeBackend = JsonGetString(result, "freeBackend") or "auto"
     end
 
     return status
 end
 
--- Switches back to the free translate.googleapis.com (gtx) endpoint. No key needed.
-function WoWTranslate_API.ConfigureGoogleFree()
+-- Switches to the free Google-backed provider.
+--   backend - optional. Omit/nil/"" for the auto fallback chain (gtx -> tw-ob ->
+--             dict-chrome-ex -> edge-translate). Pass one of the ids from
+--             WoWTranslate_API.GetFreeBackends() to pin to exactly that one.
+function WoWTranslate_API.ConfigureGoogleFree(backend)
     if not dllAvailable then
         return false, "DLL not available"
     end
 
     local success, result = pcall(function()
-        return UnitXP("WoWTranslate", "configure_google_free")
+        return UnitXP("WoWTranslate", "configure_google_free", backend or "")
     end)
 
     if not success then
@@ -619,6 +624,38 @@ function WoWTranslate_API.ConfigureGoogleFree()
     local ok, err = ParseBridgeResult(result)
     lastError = err
     return ok, err
+end
+
+-- Returns the list of free-backend ids valid as ConfigureGoogleFree()'s backend
+-- argument (and as "/wt provider <id>"), in fallback-chain order, e.g.
+-- {"gtx", "tw-ob", "dict-chrome-ex", "edge-translate"}. Falls back to a hardcoded
+-- copy of that same list if the DLL isn't available or is an older build without
+-- the list_free_backends command.
+function WoWTranslate_API.GetFreeBackends()
+    local fallback = { "gtx", "tw-ob", "dict-chrome-ex", "edge-translate" }
+
+    if not dllAvailable or not UnitXP then
+        return fallback
+    end
+
+    local success, result = pcall(function()
+        return UnitXP("WoWTranslate", "list_free_backends")
+    end)
+
+    if not success or not result or result == "" then
+        return fallback
+    end
+
+    local names = {}
+    for name in string.gmatch(result, "[^|]+") do
+        table.insert(names, name)
+    end
+
+    if #names == 0 then
+        return fallback
+    end
+
+    return names
 end
 
 -- Points the translator at a user-supplied HTTPS JSON endpoint.

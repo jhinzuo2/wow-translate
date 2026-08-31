@@ -330,12 +330,23 @@ bool TranslationClient::Initialize() {
     return ConfigureGoogleFree();
 }
 
-bool TranslationClient::ConfigureGoogleFree() {
+bool TranslationClient::ConfigureGoogleFree(const string& forcedBackend) {
+    string normalized = ToLowerCopy(TrimCopy(forcedBackend));
+
+    if (!normalized.empty()) {
+        auto names = GetFreeBackendNames();
+        if (find(names.begin(), names.end(), normalized) == names.end()) {
+            SetLastError("unknown free backend: " + normalized);
+            return false;
+        }
+    }
+
     Cleanup();
 
     {
         lock_guard<mutex> lock(configMutex);
         provider = TranslationProvider::GOOGLE_FREE;
+        forcedFreeBackend = normalized;
         lastHttpStatus = 0;
     }
 
@@ -345,7 +356,8 @@ bool TranslationClient::ConfigureGoogleFree() {
     // while WinINet-backed traffic (what PowerShell's Invoke-WebRequest actually
     // uses) was not. WinInetHttpsGet opens its own handles per request, so there's
     // no persistent session/connection to set up here.
-    LOG_INFO("Initializing Google Free translation client (WinINet)");
+    LOG_INFO("Initializing Google Free translation client (WinINet)" +
+             (normalized.empty() ? string(", auto fallback chain") : ", pinned to " + normalized));
 
     running = true;
     workerThread = thread(&TranslationClient::WorkerThreadFunc, this);
@@ -353,6 +365,15 @@ bool TranslationClient::ConfigureGoogleFree() {
     SetLastError("");
     LOG_INFO("Google Free translation client initialized");
     return true;
+}
+
+vector<string> TranslationClient::GetFreeBackendNames() {
+    return { "gtx", "tw-ob", "dict-chrome-ex", "edge-translate" };
+}
+
+string TranslationClient::GetFreeBackendName() const {
+    lock_guard<mutex> lock(configMutex);
+    return forcedFreeBackend;
 }
 
 bool TranslationClient::ConfigureCustomHttp(const string& endpoint,
@@ -459,7 +480,7 @@ bool TranslationClient::LoadConfigFromIni() {
     LOG_INFO("Loading provider configuration from WoWTranslate.ini: " + type);
 
     if (type == "google_free" || type == "googlefree" || type == "free") {
-        return ConfigureGoogleFree();
+        return ConfigureGoogleFree(IniValue(ini, "provider", "backend"));
     }
 
     if (type == "custom") {
@@ -515,7 +536,8 @@ string TranslationClient::GetProviderName() const {
 string TranslationClient::GetProviderEndpoint() const {
     lock_guard<mutex> lock(configMutex);
     if (provider == TranslationProvider::GOOGLE_FREE) {
-        return "https://translate.googleapis.com/translate_a/single (free, no key)";
+        string base = "https://translate.googleapis.com/translate_a/single (free, no key)";
+        return forcedFreeBackend.empty() ? base : base + " [pinned: " + forcedFreeBackend + "]";
     }
     return MaskUrl(customEndpoint);
 }
@@ -537,6 +559,7 @@ string TranslationClient::GetProviderStatusJson() const {
     status["ready"] = initialized;
     status["endpoint"] = endpoint;
     status["lastHttpStatus"] = lastHttpStatus;
+    status["freeBackend"] = forcedFreeBackend.empty() ? "auto" : forcedFreeBackend;
     return status.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
@@ -864,6 +887,11 @@ string TranslationClient::ParseGoogleFreeResponse(const string& json) {
 // original, unchanged behavior), then tw-ob, then dict-chrome-ex, then
 // edge-translate, in that order. All four are free/keyless — see
 // translator_core.h for what each one actually is.
+//
+// If forcedFreeBackend is set (via ConfigureGoogleFree's forcedBackend param, e.g.
+// from "/wt provider tw-ob"), only that one backend is tried - no fallback to the
+// others on failure. This matches what a user pinning a specific endpoint expects:
+// if they explicitly chose one, silently sliding onto another isn't what they asked for.
 TranslationResult TranslationClient::TranslateWithGoogleFree(const string& text, string& result,
                                                               const string& sourceLang, const string& targetLang) {
     struct FreeBackend {
@@ -877,6 +905,27 @@ TranslationResult TranslationClient::TranslateWithGoogleFree(const string& text,
         {"edge-translate", &TranslationClient::TranslateWithEdgeTranslate},
     };
     static const size_t backendCount = sizeof(backends) / sizeof(backends[0]);
+
+    string pinned;
+    {
+        lock_guard<mutex> lock(configMutex);
+        pinned = forcedFreeBackend;
+    }
+
+    if (!pinned.empty()) {
+        for (size_t i = 0; i < backendCount; ++i) {
+            if (pinned == backends[i].name) {
+                result.clear();
+                return (this->*backends[i].fn)(text, result, sourceLang, targetLang);
+            }
+        }
+        // Shouldn't happen - ConfigureGoogleFree validates against GetFreeBackendNames()
+        // before this is ever set - but fail closed rather than silently falling back
+        // to the auto chain if it somehow does.
+        result = "pinned free backend not recognized: " + pinned;
+        SetLastError(result);
+        return TranslationResult::INVALID_PARAMS;
+    }
 
     TranslationResult lastResult = TranslationResult::NETWORK_ERROR;
 

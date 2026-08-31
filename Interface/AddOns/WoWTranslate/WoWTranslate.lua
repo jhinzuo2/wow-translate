@@ -5931,11 +5931,16 @@ SlashCmdList["WOWTRANSLATE"] = function(msg)
     -- =====================================================================
     elseif cmd == "provider" then
         local sub = arg or ""
+        local freeBackends = WoWTranslate_API.GetFreeBackends()
+
         if sub == "" then
             local status = WoWTranslate_API.GetProviderStatus()
             local readyText = status.ready and "|cFF00FF00ready|r" or "|cFFFF0000not ready|r"
             DEFAULT_CHAT_FRAME:AddMessage("[WoWTranslate] Provider: " .. status.provider .. " (" .. readyText .. ")")
             DEFAULT_CHAT_FRAME:AddMessage("  Endpoint: " .. (status.endpoint ~= "" and status.endpoint or "n/a"))
+            if status.provider == "google_free" then
+                DEFAULT_CHAT_FRAME:AddMessage("  Backend: " .. (status.freeBackend or "auto"))
+            end
             if status.lastHttpStatus and status.lastHttpStatus > 0 then
                 DEFAULT_CHAT_FRAME:AddMessage("  Last HTTP status: " .. tostring(status.lastHttpStatus))
             end
@@ -5943,13 +5948,16 @@ SlashCmdList["WOWTRANSLATE"] = function(msg)
             if lastErr and lastErr ~= "" then
                 DEFAULT_CHAT_FRAME:AddMessage("  Last error: " .. lastErr)
             end
-            DEFAULT_CHAT_FRAME:AddMessage("  Usage: /wt provider google_free|custom")
+            DEFAULT_CHAT_FRAME:AddMessage("  Usage: /wt provider google_free|custom|" .. table.concat(freeBackends, "|"))
+            DEFAULT_CHAT_FRAME:AddMessage("  google_free = auto fallback chain through: " .. table.concat(freeBackends, " -> "))
+            DEFAULT_CHAT_FRAME:AddMessage("  or pin one directly, e.g. /wt provider tw-ob")
 
         elseif sub == "google_free" or sub == "google" or sub == "free" then
             local ok, err = WoWTranslate_API.ConfigureGoogleFree()
             if ok then
                 WoWTranslateDB.provider = "google_free"
-                DEFAULT_CHAT_FRAME:AddMessage("|cFF00FF00[WoWTranslate] Switched to Google Free (no key needed)|r")
+                WoWTranslateDB.freeBackend = nil
+                DEFAULT_CHAT_FRAME:AddMessage("|cFF00FF00[WoWTranslate] Switched to Google Free, auto fallback chain (no key needed)|r")
             else
                 DEFAULT_CHAT_FRAME:AddMessage("|cFFFF0000[WoWTranslate] Failed to switch provider: " .. tostring(err) .. "|r")
             end
@@ -5974,8 +5982,27 @@ SlashCmdList["WOWTRANSLATE"] = function(msg)
             end
 
         else
-            DEFAULT_CHAT_FRAME:AddMessage("|cFFFF0000[WoWTranslate] Unknown provider: " .. sub .. "|r")
-            DEFAULT_CHAT_FRAME:AddMessage("  Usage: /wt provider google_free|custom")
+            local matched = nil
+            for _, name in ipairs(freeBackends) do
+                if sub == name then
+                    matched = name
+                    break
+                end
+            end
+
+            if matched then
+                local ok, err = WoWTranslate_API.ConfigureGoogleFree(matched)
+                if ok then
+                    WoWTranslateDB.provider = "google_free"
+                    WoWTranslateDB.freeBackend = matched
+                    DEFAULT_CHAT_FRAME:AddMessage("|cFF00FF00[WoWTranslate] Switched to Google Free, pinned to " .. matched .. " (no key needed)|r")
+                else
+                    DEFAULT_CHAT_FRAME:AddMessage("|cFFFF0000[WoWTranslate] Failed to switch provider: " .. tostring(err) .. "|r")
+                end
+            else
+                DEFAULT_CHAT_FRAME:AddMessage("|cFFFF0000[WoWTranslate] Unknown provider: " .. sub .. "|r")
+                DEFAULT_CHAT_FRAME:AddMessage("  Usage: /wt provider google_free|custom|" .. table.concat(freeBackends, "|"))
+            end
         end
 
     elseif cmd == "customendpoint" then
@@ -6054,7 +6081,7 @@ SlashCmdList["WOWTRANSLATE"] = function(msg)
         DEFAULT_CHAT_FRAME:AddMessage("  /wt outchannel [type] - Show/toggle channel settings")
         DEFAULT_CHAT_FRAME:AddMessage("  /wt prefix <text> - Set message prefix")
         DEFAULT_CHAT_FRAME:AddMessage("  -- Provider --")
-        DEFAULT_CHAT_FRAME:AddMessage("  /wt provider [google_free|custom] - Show/switch translation provider")
+        DEFAULT_CHAT_FRAME:AddMessage("  /wt provider [google_free|custom|<backend>] - Show/switch translation provider (backends: gtx, tw-ob, dict-chrome-ex, edge-translate)")
         DEFAULT_CHAT_FRAME:AddMessage("  /wt customendpoint <url> - Set custom HTTPS endpoint")
         DEFAULT_CHAT_FRAME:AddMessage("  /wt customkey <key> - Set custom endpoint API key")
         DEFAULT_CHAT_FRAME:AddMessage("  /wt customauth <header> [scheme] - Set custom auth header/scheme")
@@ -6228,6 +6255,13 @@ local function OnAddonLoaded()
             WoWTranslateDB.customResponsePath)
         if not ok then
             DEFAULT_CHAT_FRAME:AddMessage("|cFFFF0000[WoWTranslate] Failed to restore custom provider: " .. tostring(err) .. "|r")
+        end
+    elseif dllOk and WoWTranslateDB.provider == "google_free" and WoWTranslateDB.freeBackend then
+        -- Same story for a pinned free backend (e.g. "/wt provider tw-ob" from a
+        -- previous session) - the DLL defaults to the auto chain on every fresh load.
+        local ok, err = WoWTranslate_API.ConfigureGoogleFree(WoWTranslateDB.freeBackend)
+        if not ok then
+            DEFAULT_CHAT_FRAME:AddMessage("|cFFFF0000[WoWTranslate] Failed to restore pinned backend '" .. WoWTranslateDB.freeBackend .. "': " .. tostring(err) .. "|r")
         end
     end
 

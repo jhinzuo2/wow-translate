@@ -133,9 +133,11 @@ static void PushConfigureResult(void* L, bool ok, const string& fallbackError) {
 // Main WoWTranslate command handler
 // Commands:
 //   UnitXP("WoWTranslate", "ping") -> "pong"
-//   UnitXP("WoWTranslate", "configure_google_free") -> "ok" or "error|..."
+//   UnitXP("WoWTranslate", "configure_google_free", [backend]) -> "ok" or "error|..."
+//     backend: omit/"" for the auto fallback chain, or one of list_free_backends to pin one
 //   UnitXP("WoWTranslate", "configure_custom", endpoint, apiKey, authHeader, authScheme, template, path) -> "ok" or error
 //   UnitXP("WoWTranslate", "provider_status") -> JSON status string
+//   UnitXP("WoWTranslate", "list_free_backends") -> pipe-delimited backend ids, e.g. "gtx|tw-ob|dict-chrome-ex|edge-translate"
 //   UnitXP("WoWTranslate", "last_error") -> last provider error
 //   UnitXP("WoWTranslate", "translate_async", requestId, text, [sourceLang], [targetLang]) -> "ok" or "error|..."
 //   UnitXP("WoWTranslate", "poll") -> "requestId|translation|error" or ""
@@ -185,13 +187,30 @@ int __fastcall detoured_UnitXP(void* L) {
                         return 1;
                     }
 
-                    // CONFIGURE_GOOGLE_FREE - Switch back to the free GTX endpoint
+                    // CONFIGURE_GOOGLE_FREE - Switch to the free provider, either the auto
+                    // fallback chain (no args) or pinned to one specific backend (3rd arg,
+                    // one of list_free_backends - e.g. "gtx", "tw-ob").
                     else if (subcmd == "configure_google_free") {
+                        string backend = lua_gettop(L) >= 3 ? lua_tostring(L, 3) : "";
+
                         if (!g_translator) {
                             g_translator = make_unique<TranslationClient>();
                         }
-                        bool ok = g_translator->ConfigureGoogleFree();
+                        bool ok = g_translator->ConfigureGoogleFree(backend);
                         PushConfigureResult(L, ok, "failed to configure Google Free provider");
+                        return 1;
+                    }
+
+                    // LIST_FREE_BACKENDS - Pipe-delimited list of valid backend ids for
+                    // configure_google_free's optional 3rd argument, in fallback order.
+                    else if (subcmd == "list_free_backends") {
+                        auto names = TranslationClient::GetFreeBackendNames();
+                        string joined;
+                        for (size_t i = 0; i < names.size(); ++i) {
+                            if (i > 0) joined += "|";
+                            joined += names[i];
+                        }
+                        lua_pushstring(L, joined);
                         return 1;
                     }
 

@@ -6,6 +6,12 @@
 ; one of: google_free (no key needed, default), custom
 type = google_free
 
+; Optional. Only used when type = google_free. Leave blank for the auto fallback
+; chain (gtx -> tw-ob -> dict-chrome-ex -> edge-translate); set to one of those
+; four names to pin the client to exactly that backend, no fallback. Same effect
+; as running e.g. "/wt provider tw-ob" in-game.
+backend =
+
 [custom]
 ; any HTTPS JSON endpoint (e.g. a self-hosted proxy or LibreTranslate) that accepts
 ; a POST body and returns a JSON response containing the translation.

@@ -87,6 +87,12 @@ private:
     std::string customRequestTemplate;
     std::string customResponsePath;
 
+    // Empty = auto fallback chain (gtx -> tw-ob -> dict-chrome-ex -> edge-translate, in
+    // that order, as implemented by TranslateWithGoogleFree). Non-empty = pin GOOGLE_FREE
+    // to exactly that one backend (must be one of GetFreeBackendNames()); no fallback is
+    // attempted if it fails. Set via ConfigureGoogleFree()'s forcedBackend parameter.
+    std::string forcedFreeBackend;
+
     std::string lastError;
     DWORD lastHttpStatus;
 
@@ -175,7 +181,16 @@ public:
     // Back-compat: connects the GOOGLE_FREE provider (what earlier versions did unconditionally).
     bool Initialize();
 
-    bool ConfigureGoogleFree();
+    // forcedBackend: "" (default) = auto fallback chain through all free backends.
+    // Otherwise must be one of GetFreeBackendNames() (e.g. "gtx", "tw-ob") to pin
+    // GOOGLE_FREE to exactly that backend with no fallback. Returns false and leaves
+    // the client unconfigured if forcedBackend is non-empty and not a recognized name.
+    bool ConfigureGoogleFree(const std::string& forcedBackend = "");
+    // The free backend ids valid as ConfigureGoogleFree()'s forcedBackend argument,
+    // in fallback-chain order.
+    static std::vector<std::string> GetFreeBackendNames();
+    // "" if GOOGLE_FREE is running the auto fallback chain, otherwise the pinned backend id.
+    std::string GetFreeBackendName() const;
     bool ConfigureCustomHttp(const std::string& endpoint,
                              const std::string& apiKey,
                              const std::string& authHeader,
