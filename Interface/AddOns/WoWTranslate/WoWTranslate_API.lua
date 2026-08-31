@@ -647,11 +647,12 @@ function WoWTranslate_API.GetFreeBackends()
     end
 
     local names = {}
-    for name in string.gmatch(result, "[^|]+") do
+    local gfind = string.gfind or string.gmatch
+    for name in gfind(result, "[^|]+") do
         table.insert(names, name)
     end
 
-    if #names == 0 then
+    if table.getn(names) == 0 then
         return fallback
     end
 
