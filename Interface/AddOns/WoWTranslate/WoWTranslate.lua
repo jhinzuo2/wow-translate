@@ -4418,7 +4418,14 @@ local function GetClassTokenFromLocalized(classLocal)
     if type(L) == "table" and L["class"] and L["class"][classLocal] then
         return L["class"][classLocal]
     end
-    if not wtClassLocalToToken then
+    -- Self-healing cache: normally built once and memoized, but if the very first
+    -- call happens before Blizzard's RAID_CLASS_COLORS/LOCALIZED_CLASS_NAMES_* are
+    -- populated (e.g. an early hook firing before those FrameXML globals exist),
+    -- the loop below would silently produce an empty table that then never gets
+    -- rebuilt, forever failing every class-color lookup for the rest of the
+    -- session. Checking with next() instead of a plain existence check means an
+    -- empty result gets retried on the next call instead of getting stuck.
+    if not wtClassLocalToToken or not next(wtClassLocalToToken) then
         wtClassLocalToToken = {}
         if RAID_CLASS_COLORS then
             for token, _ in pairs(RAID_CLASS_COLORS) do
@@ -4432,6 +4439,21 @@ local function GetClassTokenFromLocalized(classLocal)
         end
     end
     return wtClassLocalToToken[classLocal]
+end
+
+-- Resolves a GetFriendInfo()-style localized class name straight to RGB (0-1 floats)
+-- for an explicit FontString:SetTextColor() call. Unlike GetSocialPlayerClassColorHex,
+-- this skips the WIM-cache/nearby-unit fallbacks (irrelevant for a friends-list entry,
+-- where GetFriendInfo already gives us an authoritative class every time) and returns
+-- plain numbers instead of a hex string, since embedded |cffRRGGBB codes only take
+-- effect if nothing later resets the FontString's own color.
+local function GetFriendClassColorRGB(classLocal)
+    local token = GetClassTokenFromLocalized(classLocal)
+    if token and RAID_CLASS_COLORS and RAID_CLASS_COLORS[token] then
+        local c = RAID_CLASS_COLORS[token]
+        return c.r, c.g, c.b
+    end
+    return nil
 end
 
 local function GetSocialPlayerClassColorHex(rawName, classLocal)
@@ -4695,13 +4717,33 @@ local function WoWTranslate_UpdateFriendsList()
                 HideFriendTranslationFont(i)
             else
                 HideFriendTranslationFont(i)
-                local cname = ColorSocialPlayerText(name, name, class)
-                local nameWithTrans = cname .. " " .. ColorSocialPlayerText("(" .. translated .. ")", name, class)
                 if friendName then
-                    ApplyFriendListSmallFont(friendName)
-                    friendName:SetText(nameWithTrans)
+                    -- This client has a separate name-only fontstring (the one Blizzard
+                    -- normal-sizes and class-colors itself). Just swap its text for the
+                    -- translated version and re-apply the class color explicitly via
+                    -- SetTextColor - don't rely on embedded |cffRRGGBB codes surviving
+                    -- alone, and don't touch its font size. The previous version called
+                    -- ApplyFriendListSmallFont() on THIS fontstring (shrinking it to the
+                    -- small font meant for the zone/level line below it) and only ever
+                    -- embedded color via hex codes with no explicit fallback, so any
+                    -- failure in the class-color lookup left it in the FontString's
+                    -- neutral default color instead of the player's class color - the
+                    -- grey-instead-of-class-color bug. friendLoc (zone/level/class,
+                    -- correctly small and grey already) needs no translation and is
+                    -- left completely untouched.
+                    friendName:SetText(name .. " (" .. translated .. ")")
+                    local r, g, b = GetFriendClassColorRGB(class)
+                    if r then
+                        friendName:SetTextColor(r, g, b)
+                    else
+                        friendName:SetTextColor(1, 1, 1)
+                    end
                 elseif friendLoc then
+                    -- Fallback for clients with no separate name fontstring: the name,
+                    -- zone, and status all have to be rebuilt into one combined line.
                     ApplyFriendListSmallFont(friendLoc)
+                    local cname = ColorSocialPlayerText(name, name, class)
+                    local nameWithTrans = cname .. " " .. ColorSocialPlayerText("(" .. translated .. ")", name, class)
                     if connected then
                         local zstr = zone or ""
                         if playerzone ~= "" and zone == playerzone then
